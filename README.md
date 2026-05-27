@@ -122,6 +122,10 @@ curl http://localhost:8000/v1/chat/completions \
 | `API_KEY` | `sk-web2api-placeholder` | 可选 API Key 鉴权 |
 | `DSML_ENABLED` | `true` | 是否启用 DSML 工具调用 |
 
+## 基于此 skill 构建的项目
+
+- **[deepseek-web2api-free](https://github.com/snake-aabb-wtf/deepseek-web2api-free)** — 将 DeepSeek Chat 转换为 OpenAI / Anthropic 兼容 API，含 DSML 工具调用、PoW 求解、管理面板
+
 ## 限制
 
 - 工具调用基于 DSML 提示词注入，不是原生 function calling，取决于目标模型能否理解 XML 指令
