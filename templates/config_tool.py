@@ -1,6 +1,6 @@
 """
 web2api config_tool — HAR → .env GUI configurator.
-AI fills FIELD_LABELS, ENV_MAPPING, DISPLAY_FIELDS from analysis.
+AI fills FIELD_LABELS, ENV_MAPPING, DISPLAY_FIELDS, MUTABLE_KEYS.
 """
 import json
 import os
@@ -15,7 +15,7 @@ SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(SELF_DIR, ".env")
 
 # ═══════════════════════════════════════════════════════════
-# AI fills these three tables from the HAR analysis.
+# AI fills these four tables from the HAR analysis.
 # ═══════════════════════════════════════════════════════════
 
 FIELD_LABELS = {
@@ -37,7 +37,7 @@ ENV_MAPPING = [
     ("CHAT_ENDPOINT",  "chat_endpoint",      "聊天 API 端点路径"),
     ("COOKIES",        "cookies",            "登录 Cookie"),
     ("AUTH_HEADER",    "auth_header",        "Authorization 令牌"),
-    ("AUTH_TYPE",      "auth_type",          "认证类型 (none/cookie/oauth/pow)"),
+    ("AUTH_TYPE",      "auth_type",          "认证类型"),
     ("STREAMING",      "is_streaming",       "是否支持流式输出"),
     ("WEBSOCKET",      "has_websocket",      "是否使用 WebSocket"),
 ]
@@ -55,7 +55,31 @@ DISPLAY_FIELDS = [
     ("支持的参数", "supported_params"),
 ]
 
+MUTABLE_KEYS = {
+    # AI 在此列出所有"异变"的 env key（鉴权凭证、token 等会过期的值）
+    # 配置工具更新 .env 时只覆写这些 key，不动不易变部分
+    "HAR_PATH", "TARGET_URL", "CHAT_ENDPOINT",
+    "COOKIES", "AUTH_HEADER", "AUTH_TYPE",
+    "STREAMING", "WEBSOCKET",
+}
+
 # ═══════════════════════════════════════════════════════════
+
+IMMUTABLE_HEADER = """# ============================================
+# 不易变部分 — 服务器配置（配置工具不会修改）
+# ============================================
+"""
+MUTABLE_HEADER = """
+# ============================================
+# 异变部分 — 账号鉴权凭证（配置工具只更新此段）
+# ============================================
+"""
+
+DEFAULT_IMMUTABLE = """MODEL_NAME=gpt-4o
+HOST=0.0.0.0
+PORT=8000
+API_KEY=sk-web2api-placeholder
+DSML_ENABLED=false"""
 
 
 def parse_har_file(har_path: str) -> dict:
@@ -87,8 +111,7 @@ def parse_har_file(har_path: str) -> dict:
 
 
 def _extract_raw_har(har_path: str, field_name: str) -> str:
-    """Extract a single field by regex from raw HAR text.
-    AI can add target-specific patterns here."""
+    """Extract a single field by regex from raw HAR text."""
     with open(har_path, "r", encoding="utf-8") as f:
         text = f.read()
     patterns = {
@@ -105,28 +128,51 @@ def _extract_raw_har(har_path: str, field_name: str) -> str:
     return ""
 
 
-def build_env_content(info: dict) -> str:
-    lines = [
-        "# ══════════════════════════════════════════════════════",
-        "# web2api — 由 config_tool 从 HAR 自动生成",
-        "# 修改 COOKIES 或 AUTH_HEADER 后重启服务器即可",
-        "# ══════════════════════════════════════════════════════",
-        "",
-    ]
-    for env_key, info_key, comment in ENV_MAPPING:
-        val = info.get(info_key, "")
-        if val:
-            lines.append(f"# {comment}")
-            lines.append(f"{env_key}={val}")
-            lines.append("")
-    lines.append("# ── 运行时配置 ──")
-    lines.append("MODEL_NAME=gpt-4o")
-    lines.append("HOST=0.0.0.0")
-    lines.append("PORT=8000")
-    lines.append("API_KEY=sk-web2api-placeholder")
-    lines.append("DSML_ENABLED=false")
-    lines.append("")
-    return "\n".join(lines)
+def read_existing_env() -> dict:
+    """Read current .env, return dict of all key=value pairs."""
+    result = {}
+    if not os.path.exists(ENV_PATH):
+        return result
+    with open(ENV_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                result[k.strip()] = v.strip()
+    return result
+
+
+def merge_env_with_auth(auth_info: dict) -> str:
+    """Merge newly parsed auth info with existing immutable config.
+
+    - MUTABLE_KEYS: overwrite with values from auth_info
+    - Non-MUTABLE_KEYS: keep existing .env values (or use defaults)
+    """
+    existing = read_existing_env()
+
+    # Collect mutable lines from current parse result
+    mutable_lines = []
+    for env_key, info_key, _comment in ENV_MAPPING:
+        if env_key not in MUTABLE_KEYS:
+            continue
+        val = auth_info.get(info_key)
+        if val and str(val).strip():
+            mutable_lines.append(f"{env_key}={val}")
+
+    # Collect immutable lines from existing .env
+    immutable_lines = []
+    for k, v in existing.items():
+        if k not in MUTABLE_KEYS:
+            immutable_lines.append(f"{k}={v}")
+
+    if not immutable_lines:
+        immutable_lines = DEFAULT_IMMUTABLE.split("\n")
+
+    result = IMMUTABLE_HEADER + "\n".join(immutable_lines) + "\n"
+    result += MUTABLE_HEADER + "\n".join(mutable_lines) + "\n"
+    return result
 
 
 class ConfigToolGUI:
@@ -269,7 +315,9 @@ class ConfigToolGUI:
             return
 
         self._populate_tree(info)
-        self._env_content = build_env_content(info)
+
+        # Merge: 只更新异变部分，保留已有的不易变部分
+        self._env_content = merge_env_with_auth(info)
         self.env_text.delete("1.0", tk.END)
         self.env_text.insert("1.0", self._env_content)
         self.env_text.see("1.0")
