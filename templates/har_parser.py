@@ -164,7 +164,7 @@ def _analyze_response_structure(entry: dict) -> dict:
         "is_streaming": "text/event-stream" in content_type,
         "sse_event_type": "",
         "sse_data_field": "content",
-        "sse_format": "plain",
+        "sse_format": "plain_token",
         "content_field_path": "",
     }
 
@@ -189,11 +189,13 @@ def _analyze_sse_text(text: str) -> dict:
     lines = text.split("\n")
     events = []
     current_event = ""
+    has_data = False
     for line in lines[:30]:
         line = line.strip()
         if line.startswith("event: "):
             current_event = line[7:]
         elif line.startswith("data: "):
+            has_data = True
             raw = line[6:]
             try:
                 data = json.loads(raw)
@@ -202,16 +204,38 @@ def _analyze_sse_text(text: str) -> dict:
                 events.append((current_event, raw))
             current_event = ""
 
-    result = {"sse_event_type": "", "sse_data_field": "content", "sse_format": "plain"}
+    result = {"sse_event_type": "", "sse_data_field": "content", "sse_format": "plain_token"}
+
+    if not has_data:
+        return result
+
+    non_json_count = sum(1 for _, d in events if isinstance(d, str) and d.strip())
+    json_count = len(events) - non_json_count
+
+    # If all data lines are non-JSON plain text → raw_text format
+    if json_count == 0 and non_json_count > 0:
+        result["sse_format"] = "raw_text"
+        result["sse_data_field"] = ""
+        return result
 
     for event_type, data in events:
         if isinstance(data, dict):
             if "p" in data and "o" in data and "v" in data:
-                # DeepSeek format: {"p": "...", "o": "APPEND", "v": "..."}
                 result["sse_format"] = "path_op_value"
                 result["sse_data_field"] = "v"
                 result["sse_event_type"] = event_type
                 return result
+
+            # choices[0].delta.content nested pattern (ChatGPT Next Web style)
+            choices = data.get("choices")
+            if isinstance(choices, list) and len(choices) > 0:
+                delta = choices[0].get("delta", {})
+                if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                    result["sse_data_field"] = "choices[0].delta.content"
+                    result["sse_format"] = "nested"
+                    result["sse_event_type"] = event_type
+                    return result
+
             for key in ["v", "content", "text", "answer", "delta", "token"]:
                 val = data.get(key)
                 if isinstance(val, str) and len(val) > 0:
