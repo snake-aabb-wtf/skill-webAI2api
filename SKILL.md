@@ -659,8 +659,25 @@ def parse_har_file(har_path: str) -> dict:
 
 ### 6.5 Fill `MUTABLE_KEYS` — the split design
 
-This is the key innovation. `.env` is split into two sections:
+This is the key innovation. `.env` is split into two sections. **AI decides which keys go where** based on the nature of each field:
 
+| 放入 `MUTABLE_KEYS`（异变） | 不放入（不易变） |
+|---|---|
+| Cookie、Authorization 等会过期的鉴权凭证 | PORT、HOST 等服务器监听配置 |
+| Token、session_id 等每次登录变化的参数 | MODEL_NAME、API_KEY 等固定标识 |
+| TARGET_URL、CHAT_ENDPOINT（站点结构可能变） | DSML_ENABLED 等功能开关 |
+| STREAMING、WEBSOCKET 等传输方式标记 | 用户自定义的运行时参数 |
+| 从 HAR 中解析出的任何易变字段 | 不会在 Cookie 过期时一起变化的值 |
+
+**规则：凡是会随登录过期/变化的 key → 放入 `MUTABLE_KEYS`；凡是服务器本身的配置 → 不放入。**
+
+运行时 `merge_env_with_auth()` 的行为：
+1. 读取现有 `.env`
+2. **只覆写** `MUTABLE_KEYS` 中的 key
+3. 其他 key（PORT、MODEL_NAME 等）保留原值
+4. 如果 `.env` 不存在，不易变部分用 `DEFAULT_IMMUTABLE` 填充
+
+示例输出 `.env`：
 ```
 # ============================================
 # 不易变部分 — 服务器配置（配置工具不会修改）
@@ -676,27 +693,6 @@ PORT=8000
 COOKIES=...
 AUTH_HEADER=...
 ```
-
-`MUTABLE_KEYS` defines which env keys belong to the **异变部分** (volatile section). The config tool will only overwrite these keys, preserving all other settings:
-
-```python
-MUTABLE_KEYS = {
-    "HAR_PATH", "TARGET_URL", "CHAT_ENDPOINT",
-    "COOKIES", "AUTH_HEADER", "AUTH_TYPE",
-    "STREAMING", "WEBSOCKET",
-    # 目标特有:
-    # "CHAT_SESSION_ID",
-}
-```
-
-**Runtime behavior:**
-1. User clicks "解析" → `merge_env_with_auth()` is called
-2. It reads existing `.env` via `read_existing_env()`
-3. It overwrites only keys in `MUTABLE_KEYS` with values from the new HAR parse
-4. All other keys (PORT, MODEL_NAME, HOST, API_KEY, DSML_ENABLED, etc.) are kept from existing `.env`
-5. The merged result is shown in preview and saved
-
-This means users can change PORT or MODEL_NAME manually in `.env`, and the config tool will never overwrite them. Only Cookie/Auth tokens get refreshed from HAR.
 
 ### 6.6 Deliver
 
