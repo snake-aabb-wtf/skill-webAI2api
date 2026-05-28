@@ -1,102 +1,239 @@
 # web2api — 全自动逆向网页 AI 对话 → OpenAI 兼容 API
 
-你是一个全自动逆向工程专家。输入一个 AI 对话网页的 URL + Cookie，你将自动探测、分析、适配，最终生成一个 OpenAI 兼容的代理服务器。
+你是一个全自动逆向工程专家。用户只需上传一个包含请求网页 AI 对话的 **.har 文件**，你将自动解析、分析、适配，最终生成一个 OpenAI 兼容的代理服务器。
 
 ## 用户只需提供
 
-```
-URL:     https://chat.example.com           # 对话页面地址
-Cookie:  __session=xxx; token=yyy           # 登录后的 Cookie（关键鉴权信息）
-```
+上传一个 **.har 文件**（HTTP Archive Format），这是浏览器 DevTools 导出的网络请求存档。
+
+**如何获取 .har 文件：**
+1. 在浏览器中打开目标 AI 聊天页面，F12 打开 DevTools → Network 面板
+2. 勾选 "Preserve log"
+3. 发送一条聊天消息，等待 AI 回复完成
+4. 右键 → "Save all as HAR with content"（或 "Export HAR"）
+5. 将保存的 .har 文件上传给 AI
 
 **可选补充：**
-- `测试问题`: "你好，请介绍一下自己"（默认用 "Hello"）
 - `模型名`: 映射成什么模型名（默认 `gpt-4o`）
 
 ---
 
 ## 自动化工作流（AI 全权执行）
 
-### Step 0: 浏览器 DevTools 分析
+### Step 0: HAR 文件解析
 
-先引导用户在浏览器里发一条消息，从 Network 面板捕获真正的 API 请求：
-
-```python
-print("请用户在浏览器 F12 → Network 中:")
-print("  1. 发一条消息")
-print("  2. 找到聊天请求（XHR 或 Fetch 类型）")
-print("  3. 提供: 请求 URL、请求体、响应头 Content-Type、完整 Cookie 和 Authorization")
-```
-
-**从捕获的请求中提取关键信息：**
-
-| 信息 | 来源 |
-|---|---|
-| 聊天 API 端点 | Request URL |
-| 请求格式（payload） | Request Body |
-| 响应格式 / SSE 结构 | Response 或 Response Stream |
-| 鉴权方式 | Request Headers（Cookie、Authorization、X-*） |
-| **额外鉴权 / 挑战** | 检查聊天请求之前是否有前置请求（如 PoW challenge、token 刷新） |
-
-### Step 1: 自动探测 API 端点
-
-用 `httpx` 对目标网站进行主动探测，找到真正的聊天 API 接口。
+用户上传 `.har` 文件后，立即用 `har_parser.py` 自动解析：
 
 ```python
-import httpx
+from har_parser import parse_har
 
-headers = {
-    "Cookie": COOKIES,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Content-Type": "application/json",
-}
+analysis = parse_har("uploaded.har")
 
-async def probe_endpoints(base_url, headers):
-    """扫描常见的聊天 API 路径，找出哪个返回了预期响应。"""
-    candidates = [
-        "/api/chat", "/api/chat/completions", "/api/conversation",
-        "/api/generate", "/api/completion", "/v1/chat/completions",
-        "/api/send", "/api/message", "/api/ask", "/api/stream",
-        "/chat", "/conversation", "/api/v1/chat", "/api/chat/send",
-        # v0 API paths (DeepSeek, others)
-        "/api/v0/chat/completion", "/api/v0/chat_session/create",
-        "/api/v0/chat/create_pow_challenge",
-    ]
-    # 第1轮: 用简单 payload 发 POST，看哪个不返回 404
-    for path in candidates:
-        try:
-            url = f"{base_url}{path}"
-            resp = await client.post(url, json={"prompt": "Hello"}, timeout=10)
-            if resp.status_code not in (404, 405):
-                print(f"[HIT] {url} -> {resp.status_code}")
-                # 保存命中结果
-        except Exception:
-            continue
+# 自动提取的结果：
+print(f"Base URL:      {analysis.base_url}")
+print(f"Chat Endpoint: {analysis.chat_endpoint}")
+print(f"Cookies:       {analysis.cookies[:60]}...")
+print(f"Auth Header:   {analysis.auth_header}")
+print(f"Streaming:     {analysis.is_streaming}")
+print(f"SSE Field:     {analysis.sse_data_field}")
+print(f"Content Field: {analysis.content_field_path}")
+print(f"Has PoW:       {analysis.has_pow}")
+print(f"Challenge EP:  {analysis.pow_endpoint}")
 ```
 
-**探测策略（按优先级）：**
+**`har_parser.py` 自动完成以下分析：**
 
-1. **DevTools 直接捕获**（最快最准）— 用户 F12 发一条消息，直接拿到 endpoint
-2. **静态路径扫描** — 对 20+ 个常见聊天 API 路径发 POST，过滤 404/405
-3. **页面源码分析** — `GET` 目标 URL，从 HTML 中搜索 `fetch(`、`axios.post(`、`api/`、`/chat` 等关键字，提取潜在 endpoint
-4. **Payload 格式探针** — 对命中的 endpoint，用 5 种不同 payload 格式测试，找出哪个返回有效内容：
-5. **前置请求探测** — 检查 `/api/*/create_pow_challenge`、`/api/auth/*`、`/api/refresh` 等前置鉴权路径
+| 分析项 | 方法 |
+|--------|------|
+| **聊天 API 端点** | 对所有 HAR entry 评分：POST + 路径含 `/api/chat` 等关键词 + body 含 `messages`/`prompt` 字段 + 响应为 SSE/JSON |
+| **请求头** | 提取 Cookie、Authorization、Origin、Referer、User-Agent 等 |
+| **请求体格式** | 提取真实 payload 结构，保留字段占位符 |
+| **响应内容字段** | 递归遍历 JSON 找到最长字符串 + 启发式打分（content/answer/text/reply） |
+| **SSE 格式** | 检测 `text/event-stream`，分析 event 类型和 data 字段（v / content / delta / 嵌套结构） |
+| **PoW 挑战** | 扫描所有 entry 中的 `create_pow_challenge`、`challenge` 等路径 |
+| **Cookie 来源** | 优先从请求头提取，回退到前置响应中的 Set-Cookie |
+
+---
+
+### Step 1: 根据 HAR 分析结果修改 adapter.py
+
+解析 `analysis` 后，**直接修改 `templates/adapter.py` 生成最终的 `adapter.py`**。以下逐一列出哪些地方需要改、改成什么。
+
+#### 1.1 修改 `__init__` — 配置基础信息
+
+**`self.chat_endpoint`** — 改为 `analysis.chat_endpoint` 的值：
 
 ```python
-payload_templates = [
-    {"prompt": "Hello"},
-    {"messages": [{"role": "user", "content": "Hello"}]},
-    {"query": "Hello", "history": []},
-    {"content": "Hello"},
-    {"text": "Hello"},
-]
+self.chat_endpoint = analysis.chat_endpoint
+# 示例结果: "/api/chat" 或 "/api/v0/chat/completion"
 ```
 
-6. **流式检测** — 对成功的 endpoint 加 `stream: true`，检查 `Content-Type` 是否为 `text/event-stream`
+**`self.headers`** — 从 `analysis.headers` 保留除 Content-Length 外的全部请求头，同时覆盖默认 UA：
+
+```python
+self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+for key, val in analysis.headers.items():
+    kl = key.lower()
+    if kl != "content-length":
+        self.headers[key] = val
+```
+
+HAR 中已经包含了 `Cookie`（如果有），所以 analysis.headers 中已有 Cookie，无需单独构造。
+
+**`self.auth_type`** — 根据 HAR 检测结果设置：
+
+```python
+if analysis.has_pow:
+    self.auth_type = "pow"
+    self._challenge_endpoint = analysis.pow_endpoint  # 例: "/api/v0/chat/create_pow_challenge"
+# 如果既无 PoW 也无需 token refresh，auth_type 保持 "none"
+```
+
+#### 1.2 修改 `convert_request` — 根据 HAR 中的 payload 结构转换
+
+`analysis.request_body_template` 是从 HAR 中提取的**完整请求体 dict**，你需要分析这个 dict，找出哪个字段是"用户输入"，然后替换它。
+
+**规则：按优先级判断输入字段**
+
+```
+if template 中有 "messages" 字段 → messages 是输入字段
+elif template 中有 "prompt" 字段 → prompt 是输入字段
+elif template 中有 "query" 字段 → query 是输入字段，history 保留
+elif template 中有 "inputs" 字段 → inputs 是输入字段
+elif template 中有 "content" 字段 → content 是输入字段
+elif template 中有 "data" 字段且是数组 → data[0] 是输入字段
+else → 找 template 中最长的字符串字段作为输入
+```
+
+**修改后的 `convert_request` 示例（以 messages 为输入字段）：**
+
+```python
+def convert_request(self, messages, stream=False, tools=None, tool_choice=None, **kwargs):
+    if tools and self.dsml_enabled and self.dsml_ready:
+        if tool_choice != "none":
+            dsml_prompt = build_dsml_tool_prompt(tools, tool_choice)
+            messages = self._inject_dsml_prompt(messages, dsml_prompt)
+
+    # ↓ 以下根据 HAR payload 结构定制 ↓
+    payload = {
+        "messages": messages,           # 假设 HAR 的 body 是 {"messages": [...]}
+        "stream": stream,
+        # "model": kwargs.get("model", "gpt-4o"),  # 如果 HAR 中有 model 字段则解除注释
+        # "temperature": kwargs.get("temperature", 0.7),  # 如果 HAR 中有则解除注释
+    }
+    return payload
+```
+
+**以 prompt 为输入字段的示例：**
+
+```python
+def convert_request(self, messages, stream=False, tools=None, tool_choice=None, **kwargs):
+    if tools and self.dsml_enabled and self.dsml_ready:
+        if tool_choice != "none":
+            dsml_prompt = build_dsml_tool_prompt(tools, tool_choice)
+            messages = self._inject_dsml_prompt(messages, dsml_prompt)
+
+    last = messages[-1]["content"] if messages else ""
+    if isinstance(last, list):
+        last = " ".join(p.get("text", "") for p in last if p.get("type") == "text")
+    payload = {
+        "prompt": last,                  # HAR 的 body 是 {"prompt": "xxx", ...}
+        "stream": stream,
+        # 保留 HAR 中除输入字段外的其他自有字段
+        # "chat_session_id": self.session_id,  # DeepSeek 等需要 session_id
+    }
+    return payload
+```
+
+**以 query+history 为输入字段的示例：**
+
+```python
+def convert_request(self, messages, stream=False, tools=None, tool_choice=None, **kwargs):
+    # ... DSML 注入同上 ...
+    last = messages[-1]["content"] if messages else ""
+    payload = {
+        "query": last,
+        "history": self._convert_to_history(messages[:-1]),  # 将 messages 转为 history 数组
+        "stream": stream,
+    }
+    return payload
+```
+
+**关键原则：** 确保生成的 payload 结构与 HAR 中捕获的请求体**结构完全一致**，只是将用户消息替换为当前本次的消息内容。保留 HAR 中的其他字段（如 `chat_session_id`、`model`、`temperature` 等）。
+
+#### 1.3 修改 `_extract_content_from_data` — SSE 内容提取
+
+根据 `analysis.sse_format` 和 `analysis.sse_data_field` 修改：
+
+```python
+def _extract_content_from_data(self, data: dict) -> Optional[str]:
+```
+
+**SSE 格式对照表（AI 根据 analysis 的值选择对应写法）：**
+
+| `analysis.sse_format` | `analysis.sse_data_field` | 修改后的代码 |
+|---|---|---|
+| `"plain_token"` | `"v"` | `return data.get("v")` |
+| `"plain_token"` | `"content"` | `return data.get("content")` |
+| `"plain_token"` | `"text"` | `return data.get("text")` |
+| `"plain_token"` | `"delta"` | `val = data.get("delta"); return val.get("content") if isinstance(val, dict) else val` |
+| `"path_op_value"` | `"v"` | DeepSeek 格式: `return data.get("v") if data.get("o") == "APPEND" else None` |
+| `"nested"` | `"v.content"` | `v = data.get("v", {}); return v.get("content") or v.get("response", {}).get("content", "")` |
+| `"nested"` | `"delta.content"` | `d = data.get("delta", {}); return d.get("content")` |
+
+修改后删除原代码中其他不相关的 elif 分支，只保留匹配的那一条（加上兜底 fallback）。
+
+#### 1.4 修改 `_extract_content_from_json` — 非流式内容提取
+
+根据 `analysis.content_field_path` 修改。`content_field_path` 是一个类似 `"choices[0].message.content"` 或 `"answer"` 的路径字符串。
+
+将如下代码写入函数体：
+
+```python
+def _extract_content_from_json(self, data: dict) -> Optional[str]:
+    # 从 analysis.content_field_path 解析字段路径
+    # 例: "choices[0].message.content" → data["choices"][0]["message"]["content"]
+    # 例: "answer" → data["answer"]
+    # 例: "data.text" → data["data"]["text"]
+    import functools
+    try:
+        path = analysis.content_field_path
+        # 支持 "choices[0].message.content" 这种路径语法
+        parts = path.replace("[", ".").replace("]", "").split(".")
+        result = functools.reduce(lambda d, k: d[int(k) if k.isdigit() else k] if d else None, parts, data)
+        if isinstance(result, str) and len(result) > 0:
+            return result
+    except (KeyError, IndexError, TypeError):
+        pass
+    # 兜底: 遍历常见字段
+    for key in ["answer", "text", "content", "reply", "response", "output", "completion"]:
+        val = data.get(key)
+        if isinstance(val, str) and len(val) > 0:
+            return val
+    return None
+```
+
+如果 `analysis.content_field_path` 为空（HAR 响应为 SSE 而非 JSON 时），不需要修改此方法，使用默认逻辑即可。
+
+#### 1.5 修改 `convert_response` — 使用正确的响应字段
+
+修改 `convert_response` 最后几行，将：
+
+```python
+content = response.get("answer") or response.get("text") or json.dumps(response)
+```
+
+改为调用修改后的 `_extract_content_from_json`：
+
+```python
+content = self._extract_content_from_json(response)
+if not content:
+    content = json.dumps(response, ensure_ascii=False)
+```
 
 ### Step 1.5: 自动检测并处理鉴权挑战
 
-许多 AI 聊天服务（如 DeepSeek）在发消息前需要先通过一个挑战。自动检测并按类型处理：
+如果 HAR 中检测到 PoW 挑战端点，自动处理：
 
 ```python
 async def detect_and_handle_challenge(client, base_url, headers) -> dict:
@@ -190,7 +327,7 @@ async def probe_dsml_compatibility(client, base_url, headers, endpoint) -> bool:
         {"role": "user", "content": "告诉我北京的当前时间"}
     ]
 
-    # 简单 payload 格式
+    # 根据 HAR 解析得到的 payload 格式使用正确的请求结构
     for payload in [
         {"messages": test_messages, "stream": False},
         {"prompt": "告诉我北京的当前时间", "messages": test_messages},
@@ -218,190 +355,53 @@ async def probe_dsml_compatibility(client, base_url, headers, endpoint) -> bool:
 - `dsml_ready = True` — 之后所有请求遇到 `tools` 参数时，自动注入 DSML 提示词
 - `dsml_ready = False` — tools 参数被忽略，退化为纯文本对话
 
-### Step 2: 自动分析响应格式
+### Step 2: 自动验证并微调
 
-对探测成功的请求，自动分析响应结构并提取内容字段。
-
-```python
-async def analyze_response(response_json: dict) -> dict:
-    """自动遍历 JSON，找到最可能的内容字段。"""
-    def find_content_field(obj, path=""):
-        results = []
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                new_path = f"{path}.{k}" if path else k
-                if isinstance(v, str) and len(v) > 20:
-                    results.append((new_path, v[:100], k))
-                if isinstance(v, (dict, list)):
-                    results.extend(find_content_field(v, new_path))
-        elif isinstance(obj, list):
-            for i, item in enumerate(obj):
-                results.extend(find_content_field(item, f"{path}[{i}]"))
-        return results
-
-    fields = find_content_field(response_json)
-    # 按字段名启发式打分
-    KEYWORDS = ["content", "text", "answer", "reply", "response", "message", "output",
-                "completion", "result", "data.text", "choices[0].message.content"]
-    scored = []
-    for path, preview, name in fields:
-        score = sum(3 if kw in path.lower() else 0 for kw in ["content", "answer", "reply", "text"])
-        # content 字段的路径越深通常越准确
-        depth = path.count(".") + path.count("[")
-        scored.append((score + depth * 0.5, path, preview))
-    scored.sort(reverse=True)
-    return {"content_field": scored[0][1] if scored else None, "all_fields": fields}
-```
-
-**自动识别 SSE：**
-```python
-async def analyze_sse_stream(response):
-    """读取 SSE 流的前几行，自动推断字段格式。"""
-    lines = []
-    async for line in response.aiter_lines():
-        if line:
-            lines.append(line)
-        if len(lines) >= 10:
-            break
-
-    # 分析 line 模式
-    events = []
-    current_event = ""
-    for line in lines:
-        if line.startswith("event: "):
-            current_event = line[7:]
-        elif line.startswith("data: "):
-            data_str = line[6:]
-            try:
-                data = json.loads(data_str)
-                events.append((current_event, data))
-            except json.JSONDecodeError:
-                events.append((current_event, data_str))
-            current_event = ""
-
-    if events:
-        # 自动推断内容字段
-        for event_type, data in events:
-            if isinstance(data, dict):
-                # 常见字段名
-                for key in ["v", "content", "text", "answer", "delta"]:
-                    if key in data:
-                        val = data[key]
-                        if isinstance(val, str):
-                            return {"sse_type": f"data.{key}", "events": events, "format": "plain_token"}
-                        if isinstance(val, dict):
-                            sub = val.get("content") or val.get("text") or ""
-                            return {"sse_type": f"data.{key}.content", "events": events, "format": "nested"}
-                # DeepSeek 格式: {"p": "response/content", "o": "APPEND", "v": "..."}
-                if "p" in data and "o" in data and "v" in data:
-                    return {"sse_type": "deepseek_append", "events": events, "format": "path_op_value"}
-    return {"sse_type": "unknown", "events": events}
-```
-
-### Step 3: 自动生成适配器
-
-根据探测结果，自动填充 adapter.py（已内建 DSML 支持模板）：
+使用从 HAR 中提取的信息，向真实端点发验证请求，确认适配正确：
 
 ```python
-# ═══════════════════════════════════════════════════════════
-#  adapter.py  —  由 AI 自动生成，切勿手动修改
-#  探测目标: {target_url}
-#  聊天端点: {detected_endpoint}
-#  请求格式: {detected_request_format}
-#  响应字段: {detected_content_field}
-#  流式格式: {detected_sse_type}
-#  鉴权类型: {auth_type}
-#  DSML 工具调用: {dsml_ready}
-# ═══════════════════════════════════════════════════════════
+async def verify(adapter, endpoint, base_url, headers):
+    """用 HAR 中提取的 payload 模板向真实端点发请求，验证分析结果。"""
+    # 1. 验证 endpoint 可达
+    resp = await client.post(f"{base_url}{endpoint}",
+        json=adapter.request_template, headers=headers)
+    assert resp.status_code == 200, f"Endpoint 验证失败: {resp.status_code}"
 
-class ChatAdapter:
-    def __init__(self, cookies: str, base_url: str, dsml_enabled: bool = True):
-        ...
-        self.chat_endpoint = "{detected_endpoint}"
-        self.content_field = "{detected_content_field}"
-        self.auth_type = "{auth_type}"  # "none", "pow", "token_refresh"
+    # 2. 验证响应内容字段提取
+    data = resp.json()
+    content = extract_content_field(data, adapter.content_field)
+    assert content and len(content) > 0, "内容字段提取失败"
 
-        if self.auth_type == "pow":
-            self._pow_wasm = load_wasm_solver("pow_solver.wasm")
-            self._challenge_endpoint = "/api/v0/chat/create_pow_challenge"
-
-        # DSML (DeepSeek Markup Language) — 基于提示词注入的工具调用
-        self.dsml_enabled = dsml_enabled
-        self.dsml_ready = {dsml_ready}  # 探测阶段设置的
-
-    def _ensure_auth(self) -> dict:
-        """确保请求头包含有效鉴权。处理 PoW 挑战等"""
-        if self.auth_type == "pow":
-            challenge = self._fetch_challenge()
-            answer = self._pow_wasm.solve(challenge)
-            return {"X-DS-PoW-Response": encode_pow_answer(challenge, answer)}
-        return {}
-
-    def convert_request(self, messages: list, stream: bool = False,
-                        tools: list = None, tool_choice: str = None) -> dict:
-        """OUTPUT: 已验证可被目标 API 接受的请求格式"""
-        # 如果传入了 tools 且 DSML 可用，注入 DSML 提示词
-        if tools and self.dsml_enabled and self.dsml_ready:
-            if tool_choice != "none":
-                dsml_prompt = build_dsml_tool_prompt(tools, tool_choice)
-                messages = self._inject_dsml_prompt(messages, dsml_prompt)
-        return {detected_request_format}
-
-    async def send_request(self, payload: dict) -> dict:
-        auth_headers = self._ensure_auth()
-        async with httpx.AsyncClient(headers={**self.headers, **auth_headers}, timeout=120) as client:
-            resp = await client.post(f"{self.base_url}{self.chat_endpoint}", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            # 检查响应是否含 DSML 标签
-            if self.dsml_enabled and self.dsml_ready:
-                text = json.dumps(data, ensure_ascii=False)
-                if has_dsml_content(text):
-                    content = extract_content_field(data)
-                    if content and has_dsml_content(content):
-                        return self.convert_with_dsml(content)
-            return self.convert_response(data)
-
-    async def stream_request(self, payload: dict) -> AsyncGenerator[bytes, None]:
-        auth_headers = self._ensure_auth()
-        use_sieve = self.dsml_enabled and self.dsml_ready
-        async with httpx.AsyncClient(headers={**self.headers, **auth_headers}, timeout=120) as client:
-            async with client.stream("POST", f"{self.base_url}{self.chat_endpoint}", json=payload) as resp:
-                sieve = StreamSieve() if use_sieve else None
-                async for line in resp.aiter_lines():
-                    if not line: continue
-                    content = self._extract_content(line)
-                    if content is None: continue
-
-                    if sieve:
-                        result = sieve.feed(content)
-                        for text in result.text_parts:
-                            if text:
-                                yield format_sse_chunk(text)
-                        for tc in result.tool_calls:
-                            yield format_tool_call_sse(tc)
-                        if result.pending:
-                            continue
-                    else:
-                        yield format_sse_chunk(content)
-
-                if sieve:
-                    flush_result = sieve.flush()
-                    for text in flush_result.text_parts:
-                        if text: yield format_sse_chunk(text)
-                    for tc in flush_result.tool_calls:
-                        yield format_tool_call_sse(tc)
-
-                yield b"data: [DONE]\n\n"
-
-    def _extract_content(self, line: str) -> Optional[str]:
-        """自动适配 {detected_sse_type} 格式"""
-        ...
-
-    def _inject_dsml_prompt(self, messages: list, dsml_prompt: str) -> list:
-        """将 DSML 提示词注入 system message"""
-        ...
+    # 3. 验证流式（如果 HAR 中检测到 SSE）
+    if adapter.is_streaming:
+        async with client.stream("POST", f"{base_url}{endpoint}",
+            json={**adapter.request_template, "stream": True}, headers=headers) as resp:
+            lines = []
+            async for line in resp.aiter_lines():
+                if line: lines.append(line)
+                if len(lines) >= 5: break
+            assert len(lines) > 0, "流式无响应"
 ```
+
+验证失败时的自动修复策略：
+
+| 失败情况 | 自动修复 |
+|----------|---------|
+| endpoint 返回 401/403 | 用 HAR 提取的最新 Cookie 重试；如果仍失败，告知用户 Cookie 可能已过期 |
+| 内容字段为空 | 递归遍历完整响应 JSON，重新评分所有字符串字段 |
+| SSE 格式不匹配 | 读取前 20 行 SSE，逐个尝试 `v`/`content`/`text`/`delta`/`token`/`data` |
+| 响应被截断 | 检查 HAR 中是否捕获了完整响应（看 `content.size` 和 `response.content.text.length`） |
+
+### Step 3: 提交最终 adapter.py
+
+根据 **Step 1** 的修改清单，逐一修改 `templates/adapter.py` 中的对应方法。修改完成后，确认：
+- [ ] `__init__` 中的 `chat_endpoint` 已设为 HAR 识别的值
+- [ ] `self.headers` 已包含 HAR 中所有的请求头
+- [ ] `auth_type` 已正确设置
+- [ ] `convert_request` 使用 HAR payload 的精确结构
+- [ ] `_extract_content_from_data` 只匹配 HAR 中 SSE 的 data 字段
+- [ ] `_extract_content_from_json` 能从 HAR 响应路径中提取内容
+- [ ] `convert_response` 调用自定义的 `_extract_content_from_json`
 
 ### Step 4: 自动验证
 
@@ -483,40 +483,29 @@ curl -s -N http://localhost:8000/v1/chat/completions \
 
 ## 自动探测失败时的降级策略
 
-如果自动扫描没有命中任何 endpoint，AI 应该：
+如果 HAR 文件解析无法定位聊天 API（评分最高的 entry 分数过低），AI 应该：
 
-1. **抓取首页 HTML** → 用正则搜 `fetch(` / `api/` / `endpoint` / `url:` → 提取候选路径
-2. **查看 robots.txt** → `GET /robots.txt` → 可能暴露 API 路径
-3. **尝试 GET 常见路径** → 有些页面在 GET 时会返回 API 文档
-4. **分析页面 JS** → 用简单正则提取字符串中的 URL 模式
-5. **检查前置请求** → 先请求常见的 challenge/token 路径，看是否需要前置鉴权
-6. **上述都失败** → 向用户求助：建议用户在 F12 Network 中发一条消息，截取请求 URL 和方法
+1. **列出 HAR 中所有 POST 请求**，让用户确认哪一个是聊天请求
+2. **抓取首页 HTML** → 用正则搜 `fetch(` / `api/` / `endpoint` / `url:` → 提取候选路径
+3. **查看 robots.txt** → `GET /robots.txt` → 可能暴露 API 路径
+4. **尝试 GET 常见路径** → 有些页面在 GET 时会返回 API 文档
+5. **分析页面 JS** → 用简单正则提取字符串中的 URL 模式
+6. **检查前置请求** → 先请求常见的 challenge/token 路径，看是否需要前置鉴权
+7. **上述都失败** → 向用户求助：建议用户重新导出 HAR，确保勾选了 "Preserve log" 且在发送消息后立即保存
 
 ```python
-# 降级: 从 HTML 中提取 API 路径
-async def extract_endpoints_from_html(base_url: str, headers: dict) -> list:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(base_url, headers=headers)
-        html = resp.text
-        # 搜索常见模式
-        patterns = [
-            r'fetch\s*\(\s*["\']([^"\']+)["\']',
-            r'axios\.\w+\s*\(\s*["\']([^"\']+)["\']',
-            r'url:\s*["\']([^"\']+)["\']',
-            r'endpoint:\s*["\']([^"\']+)["\']',
-            r'"api/([^"\']+)"',
-            r"'api/([^\"']+)'",
-            r'/api/\w+',
-        ]
-        urls = set()
-        for p in patterns:
-            for m in re.finditer(p, html):
-                url = m.group(1) if m.lastindex else m.group(0)
-                if url.startswith("/"):
-                    urls.add(url)
-                elif url.startswith("http"):
-                    urls.add(url)
-        return sorted(urls)
+# 降级: 列出 HAR 中所有 POST 请求供用户选择
+def list_post_entries(har_path: str):
+    with open(har_path) as f:
+        har = json.load(f)
+    entries = har.get("log", {}).get("entries", [])
+    for i, entry in enumerate(entries):
+        req = entry.get("request", {})
+        if req.get("method") == "POST":
+            url = req.get("url", "")
+            body = req.get("postData", {}).get("text", "")[:100]
+            print(f"[{i}] {url}")
+            print(f"    Body: {body}")
 ```
 
 ---
@@ -542,11 +531,12 @@ async def extract_endpoints_from_html(base_url: str, headers: dict) -> list:
 
 1. **adapter.py** — 完整填充的适配器（已验证通过）
 2. **server.py** — OpenAI 兼容代理服务器
-3. **requirements.txt** — 依赖清单
-4. **.env.example** — 配置模板（不含敏感信息）
-5. **启动命令** — 一行启动代理
-6. **验证结果** — 流式 + 非流式测试截图级确认
-7. **集成指南** — 如何接入 Claude Code / Cursor / 任意 OpenAI SDK，以及已知限制
+3. **har_parser.py** — HAR 解析工具（保留以便后续更新）
+4. **requirements.txt** — 依赖清单
+5. **.env.example** — 配置模板（不含敏感信息）
+6. **启动命令** — 一行启动代理
+7. **验证结果** — 流式 + 非流式测试截图级确认
+8. **集成指南** — 如何接入 Claude Code / Cursor / 任意 OpenAI SDK，以及已知限制
 
 ---
 

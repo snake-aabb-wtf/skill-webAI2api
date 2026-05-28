@@ -1,19 +1,24 @@
 # web2api — 全自动逆向网页 AI 对话 → OpenAI 兼容 API
 
-输入任意 AI 聊天网页的 URL + Cookie，自动探测、分析、适配，最终生成一个 **OpenAI 兼容的代理服务器**。任何支持 OpenAI API 的工具（Claude Code、Cursor、Continue、自定义脚本等）都可以通过此代理使用目标网站的聊天能力。
+上传一个 **.har 文件**（浏览器 DevTools 导出的网络请求存档），自动解析、分析、适配，最终生成一个 **OpenAI 兼容的代理服务器**。任何支持 OpenAI API 的工具（Claude Code、Cursor、Continue、自定义脚本等）都可以通过此代理使用目标网站的聊天能力。
 
 ---
 
 ## 原理
 
 ```
-用户输入 (URL + Cookie)
+用户上传 .har 文件（浏览器导出）
     │
     ▼
-Step 0: 浏览器 DevTools 分析（引导用户捕获真实请求）
+Step 0: HAR 文件自动解析（har_parser.py）
+    │   ├─ 自动识别聊天 API 端点（评分算法）
+    │   ├─ 提取请求头 / Cookie / Authorization
+    │   ├─ 提取请求体格式模板
+    │   ├─ 分析响应结构（JSON 字段 / SSE 格式）
+    │   └─ 检测 PoW 挑战端点
     │
     ▼
-Step 1: 自动探测 API 端点（扫描 20+ 常用路径 + 5 种 payload 格式）
+Step 1: 利用 HAR 结果构建适配器（无需手动探测）
     │
     ▼
 Step 1.5: 自动处理鉴权挑战（PoW / Token 刷新 / Captcha）
@@ -22,7 +27,7 @@ Step 1.5: 自动处理鉴权挑战（PoW / Token 刷新 / Captcha）
 Step 1.6: 自动探测 DSML 兼容性（工具调用支持）
     │
     ▼
-Step 2: 自动分析响应格式（JSON 字段探测 / SSE 格式推断）
+Step 2: 自动验证并微调（发真实请求确认）
     │
     ▼
 Step 3: 自动生成适配器 adapter.py + server.py
@@ -36,6 +41,19 @@ Step 5: 启动代理 + 端到端测试
     ▼
 Step 6: 输出集成指南
 ```
+
+## 与传统方式的区别
+
+| 步骤 | 传统方式（旧） | HAR 方式（新） |
+|------|---------------|---------------|
+| 输入 | URL + Cookie + 手动 F12 分析 | 一个 .har 文件就够了 |
+| API 端点 | 用户手动从 Network 面板复制 | 自动评分识别 |
+| 请求头 | 用户手动提供 Cookie 和 Authorization | 自动从 HAR 提取 |
+| 请求体格式 | 用户手动粘贴 Request Body | 自动提取为模板 |
+| 响应分析 | AI 猜测内容字段 | 自动递归遍历评分 |
+| SSE 检测 | AI 猜测格式 | 自动分析真实 SSE 数据 |
+| PoW 检测 | 用户/AI 手动探测 | 自动扫描所有 HAR entry |
+| 人工干预 | 每步都可能需要用户配合 | 只需上传 HAR 文件 |
 
 ## 特性
 
@@ -61,6 +79,7 @@ Step 6: 输出集成指南
 | Open WebUI | `/chat/completions` |
 | Gradio 聊天 | `/api/chat` |
 | 自建 NextJS 前端 | `/api/chat` |
+| **任意自定义前端** | **自动识别，无需预置** |
 
 ## 文件结构
 
@@ -68,6 +87,7 @@ Step 6: 输出集成指南
 web2api/
 ├── prompt.md                     # 主规格文档（AI 执行的工作流指令）
 ├── templates/
+│   ├── har_parser.py             # 【新增】HAR 文件解析器
 │   ├── adapter.py                # 适配器模板（含 DSML 工具调用支持）
 │   ├── server.py                 # FastAPI 代理服务器模板
 │   ├── tool_dsml.py              # DSML prompt 构建 + XML 解析
@@ -81,50 +101,21 @@ web2api/
 
 1. **adapter.py** — 完整填充的适配器（已验证通过）
 2. **server.py** — OpenAI 兼容代理服务器
-3. **requirements.txt** — 依赖清单
-4. **.env.example** — 配置模板
-5. **启动命令** — 一行启动代理
-6. **验证结果** — 流式 + 非流式测试确认
-7. **集成指南** — 如何接入 Claude Code / Cursor / 任意 OpenAI SDK
+3. **har_parser.py** — HAR 解析工具（保留以便后续更新）
+4. **requirements.txt** — 依赖清单
+5. **.env.example** — 配置模板
+6. **启动命令** — 一行启动代理
+7. **验证结果** — 流式 + 非流式测试确认
+8. **集成指南** — 如何接入 Claude Code / Cursor / 任意 OpenAI SDK
 
-## 快速使用
+## 如何获取 .har 文件
 
-```bash
-# 1. 安装依赖
-pip install fastapi uvicorn httpx python-dotenv
-
-# 2. 配置环境变量
-# TARGET_URL=https://chat.example.com
-# COOKIES=__session=xxx; token=yyy
-# MODEL_NAME=gpt-4o
-
-# 3. 启动代理
-python server.py
-
-# 4. 测试
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好"}],"stream":false}'
-
-# 5. 在任意 OpenAI 兼容工具中配置
-# OPENAI_API_BASE=http://localhost:8000/v1
-```
-
-## 配置
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `TARGET_URL` | `https://chat.example.com` | 目标 AI 聊天网站地址 |
-| `COOKIES` | `""` | 登录后的 Cookie（关键鉴权） |
-| `MODEL_NAME` | `gpt-4o` | 代理暴露的模型名 |
-| `HOST` | `0.0.0.0` | 监听地址 |
-| `PORT` | `8000` | 监听端口 |
-| `API_KEY` | `sk-web2api-placeholder` | 可选 API Key 鉴权 |
-| `DSML_ENABLED` | `true` | 是否启用 DSML 工具调用 |
-
-## 基于此 skill 构建的项目
-
-- **[deepseek-web2api-free](https://github.com/snake-aabb-wtf/deepseek-web2api-free)** — 将 DeepSeek Chat 转换为 OpenAI / Anthropic 兼容 API，含 DSML 工具调用、PoW 求解、管理面板
+1. 在浏览器中打开目标 AI 聊天页面，按 `F12` 打开 DevTools
+2. 切换到 **Network**（网络）面板
+3. 勾选 **Preserve log**（保留日志）
+4. 发送一条聊天消息，等待 AI 回复完成
+5. 在 Network 面板中右键任意请求 → **Save all as HAR with content**（或 Export HAR）
+6. 将保存的 `.har` 文件提供给 AI
 
 ## 限制
 
