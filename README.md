@@ -85,13 +85,14 @@ Step 6: 输出集成指南
 
 ```
 web2api/
-├── prompt.md                     # 主规格文档（AI 执行的工作流指令）
+├── SKILL.md                      # 技能定义（AI 执行的工作流指令）
 ├── templates/
-│   ├── har_parser.py             # 【新增】HAR 文件解析器
+│   ├── har_parser.py             # HAR 文件解析器
 │   ├── adapter.py                # 适配器模板（含 DSML 工具调用支持）
 │   ├── server.py                 # FastAPI 代理服务器模板
 │   ├── tool_dsml.py              # DSML prompt 构建 + XML 解析
 │   └── tool_sieve.py             # StreamSieve 流式分离引擎
+├── LICENSE
 └── README.md                     # 本文件
 ```
 
