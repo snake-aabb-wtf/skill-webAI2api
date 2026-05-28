@@ -96,6 +96,7 @@ web2api/
 │   ├── har_parser.py             # HAR 文件解析器
 │   ├── adapter.py                # HTTP 适配器模板（含 DSML 工具调用支持）
 │   ├── ws_adapter.py             # WebSocket 适配器模板
+│   ├── config_tool.py            # GUI 配置工具模板（HAR → .env，支持 Cookie 续期）
 │   ├── server.py                 # FastAPI 代理服务器模板（支持 HTTP + WS 双模式）
 │   ├── tool_dsml.py              # DSML prompt 构建 + XML 解析
 │   └── tool_sieve.py             # StreamSieve 流式分离引擎
@@ -108,13 +109,26 @@ web2api/
 运行完成后，AI 将生成：
 
 1. **adapter.py** 或 **ws_adapter.py** — 完整填充的适配器（已验证通过）
-2. **server.py** — OpenAI 兼容代理服务器
+2. **config_tool.py** — GUI 配置工具：选择 HAR → 解析 → 保存 .env → 启动代理
+3. **server.py** — OpenAI 兼容代理服务器
 3. **har_parser.py** — HAR 解析工具（保留以便后续更新）
 4. **requirements.txt** — 依赖清单（含 `websockets`）
 5. **.env.example** — 配置模板
 6. **启动命令** — 一行启动代理
 7. **验证结果** — 流式 + 非流式测试确认（HTTP 或 WebSocket 对应）
 8. **集成指南** — 如何接入 Claude Code / Cursor / 任意 OpenAI SDK
+
+## Cookie 过期怎么办
+
+不需要重新找 AI。直接用交付的 `config_tool.py`：
+
+1. 双击 `config_tool.py` 打开 GUI
+2. 点击"浏览..."选择之前用过的 `.har` 文件
+3. 点击"解析"读取配置
+4. 在浏览器 DevTools 复制新的 Cookie 字符串
+5. 粘贴到 `.env` 预览的 `COOKIES=` 行（或直接修改 .env 文件）
+6. 点击"保存到 .env"
+7. 点击"启动代理服务器"
 
 ## 如何获取 .har 文件
 

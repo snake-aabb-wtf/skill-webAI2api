@@ -577,7 +577,100 @@ Then replace `_connect()` calls in `send_request`/`stream_request` with `_get_co
 
 ---
 
-## Step 6 — Verify with Real Requests
+## Step 6 — Generate config_tool.py
+
+Copy `templates/config_tool.py` → output `config_tool.py`. This is a standalone Tkinter GUI that lets the user re-configure .env from any HAR file without re-running the AI.
+
+### 6.1 Fill `FIELD_LABELS`
+
+Map every key in the `info` dict (from `parse_har_file()`) to a Chinese label:
+
+```python
+FIELD_LABELS = {
+    "base_url": "目标地址",
+    "chat_endpoint": "聊天端点",
+    "cookies": "Cookie",
+    "auth_header": "Authorization",
+    "auth_type": "认证类型",
+    "is_streaming": "流式支持",
+    "has_websocket": "WebSocket",
+    "has_pow": "PoW 挑战",
+    "content_field_path": "内容字段路径",
+    "supported_params": "支持的参数",
+    # HAR特有的字段，从 analysis 中取:
+    # "chat_session_id": "会话 ID",
+}
+```
+
+Only include keys that exist in `analysis`. If the target has unique fields (DeepSeek's `chat_session_id`, Gemini's `bl`/`f.sid`/`at`/`sn`), add them here.
+
+### 6.2 Fill `ENV_MAPPING`
+
+Map (`env_key`, `info_key`, `comment`) for every field that should appear in .env:
+
+```python
+ENV_MAPPING = [
+    ("HAR_PATH",       "har_path",           "HAR 文件路径（用于重新解析）"),
+    ("TARGET_URL",     "base_url",           "目标网站地址"),
+    ("CHAT_ENDPOINT",  "chat_endpoint",      "聊天 API 端点路径"),
+    ("COOKIES",        "cookies",            "登录 Cookie"),
+    ("AUTH_HEADER",    "auth_header",        "Authorization 令牌"),
+    ("AUTH_TYPE",      "auth_type",          "认证类型"),
+    ("STREAMING",      "is_streaming",       "是否支持流式输出"),
+    ("WEBSOCKET",      "has_websocket",      "是否使用 WebSocket"),
+    # 目标特有:
+    # ("CHAT_SESSION_ID", "chat_session_id", "会话 ID"),
+]
+```
+
+### 6.3 Fill `DISPLAY_FIELDS`
+
+Control which fields appear in the TreeView and in what order:
+
+```python
+DISPLAY_FIELDS = [
+    ("目标地址", "base_url"),
+    ("聊天端点", "chat_endpoint"),
+    ("认证类型", "auth_type"),
+    ("Cookie", "cookies"),
+    ("Authorization", "auth_header"),
+    # ...
+]
+```
+
+### 6.4 Customize `parse_har_file()` if needed
+
+The default implementation calls `har_parser.parse_har()` and extracts common fields. If the target has unique parameters not covered by `har_parser.py`, add extraction logic in `parse_har_file()` or use the `_extract_raw_har()` helper which can regex-search the raw HAR text for specific keys.
+
+Example for DeepSeek (adds chat_session_id):
+
+```python
+def parse_har_file(har_path: str) -> dict:
+    info = _default_parse(har_path)  # calls har_parser.parse_har
+    # Extract target-specific fields
+    chat_session_id = _extract_raw_har(har_path, "chat_session_id")
+    if chat_session_id:
+        info["chat_session_id"] = chat_session_id
+        FIELD_LABELS["chat_session_id"] = "会话 ID"
+        ENV_MAPPING.append(("CHAT_SESSION_ID", "chat_session_id", "DeepSeek 会话 ID"))
+        DISPLAY_FIELDS.append(("会话 ID", "chat_session_id"))
+    return info
+```
+
+### 6.5 Deliver
+
+Add to the output deliverables. The user can double-click `config_tool.py` to:
+1. Select a HAR file from disk
+2. Click "解析" to extract all config fields
+3. View the generated .env in a syntax-highlighted preview
+4. Click "保存到 .env" to persist
+5. Click "启动代理服务器" to run `server.py`
+
+When Cookie expires, the user just re-opens `config_tool.py`, selects the same HAR (or a fresh one), clicks "解析" → "保存" → "启动", all without touching the AI.
+
+---
+
+## Step 7 — Verify with Real Requests
 
 Run this exact verification protocol, in order:
 
@@ -703,7 +796,7 @@ async def verify_ws_streaming():
 
 ---
 
-## Step 7 — Start Proxy & Final Test
+## Step 8 — Start Proxy & Final Test
 
 ```bash
 pip install fastapi uvicorn httpx python-dotenv websockets
@@ -725,13 +818,14 @@ curl -s -N http://localhost:8000/v1/chat/completions \
 
 ---
 
-## Step 8 — Deliverables
+## Step 9 — Deliverables
 
 
 
 1. `adapter.py` — modified HTTP adapter (if HTTP detected)
 2. `ws_adapter.py` — WebSocket adapter (if `has_websocket` is True)
-3. `server.py` — from template (no changes needed)
+3. `config_tool.py` — GUI configurator (HAR → .env, with Cookie update support)
+4. `server.py` — from template (no changes needed)
 3. `.env.example`:
    ```
    TARGET_URL=https://chat.example.com
