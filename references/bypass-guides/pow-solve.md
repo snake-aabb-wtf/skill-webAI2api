@@ -13,20 +13,25 @@
 - `create_pow_challenge` — DeepSeek 标准路径
 - `challenge` — 通用路径
 - `pow` — 通用缩写
-- `captcha` / `turnstile` — 注意区分 PoW 与图形验证码
 
 ### 从响应结构识别
 
-PoW 挑战的响应 JSON 通常包含以下字段组合：
+PoW 挑战的响应 JSON 通常包含这些字段。解析时注意嵌套路径，常见于 `data.biz_data.challenge` 下：
 
-| 字段 | 含义 | 示例 |
-|---|---|---|
-| `algorithm` | 哈希算法名 | `DeepSeekHashV1`, `SHA256` |
-| `challenge` | 挑战标识符 | 长随机字符串 |
-| `salt` | 盐值 | 时间戳或随机串 |
-| `expire_at` | 过期时间戳（秒） | `1716800000` |
-| `difficulty` | 哈希前缀零字节数 | `4` |
-| `signature` | 签名（用于构造应答） | 长字符串 |
+```python
+def extract_challenge(resp_json):
+    # DeepSeek 嵌套格式: data.biz_data.challenge
+    biz = resp_json.get("data", {}).get("biz_data", {}).get("challenge", resp_json)
+    return {
+        "algorithm": biz.get("algorithm", "SHA256"),
+        "challenge": biz["challenge"],
+        "salt": biz["salt"],
+        "expire_at": biz["expire_at"],
+        "difficulty": biz["difficulty"],
+        "signature": biz["signature"],
+        "target_path": biz.get("target_path", "/api/chat"),
+    }
+```
 
 ### 从请求顺序推断
 
@@ -41,24 +46,71 @@ PoW 挑战的响应 JSON 通常包含以下字段组合：
 | difficulty > 5 | 告知用户难度过高，可能无法实时求解 |
 | 响应结构不标准 | 先用通用解析提取字段，再逐个尝试哈希算法 |
 
+## 两种求解方案
+
+### 纯 Python 哈希（无额外依赖）
+
+```python
+import hashlib, base64, json
+
+def solve(salt, expire_at, difficulty, target_path):
+    nonce = 0
+    while True:
+        raw = f"{salt}{expire_at}{nonce}{target_path}"
+        h = hashlib.sha256(raw.encode()).hexdigest()
+        if h.startswith("0" * difficulty):
+            return nonce
+        nonce += 1
+
+def encode_answer(challenge, salt, answer, signature, target_path):
+    payload = {
+        "algorithm": "DeepSeekHashV1",
+        "challenge": challenge, "salt": salt,
+        "answer": answer, "signature": signature,
+        "target_path": target_path,
+    }
+    return base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+```
+
+### WASM 求解（高性能，需提取 wasm 文件）
+
+从 HAR 或 DevTools Sources 中定位 `.wasm` 文件后：
+
+```python
+from wasmtime import Store, Module, Instance
+store = Store()
+module = Module(store.engine, wasm_bytes)
+instance = Instance(store, module, [])
+exports = instance.exports(store)
+solve_fn = exports.get("wasm_solve") or exports.get("solve")
+answer = solve_fn(store, challenge, salt, expire_at, difficulty)
+```
+
 ## 集成位置
 
-PoW 是**每次请求前的前置步骤**，应放在 `_ensure_auth_headers()` 中。每次聊天请求都会调用它：
+PoW 是**每次请求前的前置步骤**，放在 `_ensure_auth_headers()` 中：
 
-1. 检查 `expire_at` 是否已过期 → 是则重新获取挑战
-2. 求解碰撞 → 编码应答 → 返回请求头
-3. 将返回的 header（如 `X-DS-PoW-Response`）合并到聊天请求中
+```python
+def _ensure_auth_headers(self):
+    if self.auth_type != "pow":
+        return {}
+    challenge = self._fetch_challenge()
+    answer = solve(challenge["salt"], challenge["expire_at"],
+                   challenge["difficulty"], challenge["target_path"])
+    return {"X-DS-PoW-Response": encode_answer(
+        challenge["challenge"], challenge["salt"],
+        answer, challenge["signature"], challenge["target_path"])}
+```
 
 ## 边界情况
 
 - **挑战复用**：部分站点允许同一挑战在 expire 前多次使用，可缓存减少开销
 - **难度波动**：同一站点在不同负载下的 difficulty 可能不同，求解时间不固定
 - **算法变种**：除了 SHA256，还可能遇到 SHA512、BLAKE2、或自定义哈希
-- **嵌套响应**：部分站点的挑战数据嵌套在 `data.biz_data.challenge` 下，需递归提取
 - **签名验证**：应答中的 signature 必须与挑战时返回的一致，否则服务端拒绝
 
 ## 彻底失败
 
-- 无法定位 challenge 端点 → 告知用户此站点可能使用自定义反自动化方案
 - 求解时间超过 30 秒 → 提示用户 difficulty 过高，建议换目标
 - 应答发送后仍返回 401 → 挑战已过期，需要重新获取
+- 响应结构完全无法解析 → 此站点使用非标准 PoW，不可绕过
