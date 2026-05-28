@@ -22,6 +22,7 @@ class HarAnalysis:
         self.sse_format: str = "plain_token"
         self.has_pow: bool = False
         self.pow_endpoint: str = ""
+        self.supported_params: list[str] = []
         self.all_endpoints: list[str] = []
         self.chat_entry_index: int = -1
 
@@ -303,6 +304,88 @@ def _find_challenge_entries(entries: list) -> list:
     return challenges
 
 
+# Parameters known from OpenAI spec that a target API might support.
+# Key = the name used in the target API's request body.
+# Value = the OpenAI canonical name (used in SKILL.md and user-facing docs).
+# Multiple possible key names map to the same OpenAI concept.
+PARAM_ALIASES = {
+    "temperature": "temperature",
+    "max_tokens": "max_tokens",
+    "max_length": "max_tokens",
+    "max_new_tokens": "max_tokens",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "presence_penalty": "presence_penalty",
+    "frequency_penalty": "frequency_penalty",
+    "repetition_penalty": "repetition_penalty",
+    "stop": "stop",
+    "stop_sequences": "stop",
+    "n": "n",
+    "seed": "seed",
+    "user": "user",
+    "system": "system",
+    "system_prompt": "system",
+}
+
+
+def _infer_supported_params(entries: list, chat_idx: int) -> list[str]:
+    """Scan all chat-like POST requests in the HAR to find which
+    OpenAI-compatible parameters the target API actually supports.
+
+    Strategy:
+      1. Collect all POST entries whose URL path matches
+         the primary chat entry's endpoint.
+      2. For each entry, extract the JSON request body keys.
+      3. Intersect with PARAM_ALIASES — if a key appears in any
+         request with a non-null value, mark the canonical param
+         as supported.
+
+    This is zero-cost: it reads what the browser already sent,
+    without sending any extra probe requests.
+    """
+    chat_entry = entries[chat_idx]
+    chat_req = chat_entry.get("request", {})
+    endpoint_path = urlparse(chat_req.get("url", "")).path
+
+    seen_values = {}  # canonical param name → set of distinct values seen
+
+    for entry in entries:
+        req = entry.get("request", {})
+        if req.get("method") != "POST":
+            continue
+        path = urlparse(req.get("url", "")).path
+        if path != endpoint_path:
+            continue
+
+        post_data = req.get("postData", {})
+        text = post_data.get("text", "")
+        try:
+            body = json.loads(text) if text else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not isinstance(body, dict):
+            continue
+
+        for body_key, body_val in body.items():
+            canonical = PARAM_ALIASES.get(body_key)
+            if canonical is None:
+                continue
+            if canonical not in seen_values:
+                seen_values[canonical] = set()
+            # Treat None and 0 as "not really set"
+            if body_val is not None and body_val != 0:
+                val_str = str(body_val)
+                seen_values[canonical].add(val_str)
+
+    result = []
+    for canonical, values in seen_values.items():
+        if len(values) >= 1:
+            result.append(canonical)
+
+    return result
+
+
 def parse_har(har_path: str) -> HarAnalysis:
     """Parse a HAR file and extract all information needed for the adapter.
 
@@ -356,6 +439,8 @@ def parse_har(har_path: str) -> HarAnalysis:
 
     if isinstance(body, dict):
         analysis.request_body_template = body
+
+    analysis.supported_params = _infer_supported_params(entries, chat_idx)
 
     resp_struct = _analyze_response_structure(chat_entry)
     analysis.is_streaming = resp_struct["is_streaming"]

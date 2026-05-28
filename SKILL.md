@@ -69,6 +69,8 @@ analysis.has_pow               # True if any entry hit a path with "challenge"/"
 analysis.pow_endpoint          # "/api/v0/chat/create_pow_challenge"
 analysis.all_endpoints         # list of all unique URL paths in HAR
 analysis.chat_entry_index      # index of the matched entry
+analysis.supported_params      # ["temperature", "top_p", "max_tokens", ...]
+                               # inferred from HAR bodies (zero-cost probe)
 ```
 
 ---
@@ -153,23 +155,68 @@ if history_field:
 payload["stream"] = stream
 ```
 
-### 1.1 Handle OpenAI parameters that map to HAR fields
+### 1.1 Dynamic parameter passthrough (auto-inferred from HAR)
 
-Check if the HAR payload contains any of these keys. If yes, pass through the corresponding kwargs value. If not, omit them entirely (the target API doesn't support them).
+`analysis.supported_params` contains every OpenAI-compatible parameter that the target API was observed using in the HAR. Use this list to dynamically decide which kwargs to pass through:
 
 ```python
-PARAM_MAP = {
-    "temperature": "temperature",
-    "max_tokens": "max_tokens",
-    "top_p": "top_p",
-    "top_k": "top_k",
-    "presence_penalty": "presence_penalty",
-    "frequency_penalty": "frequency_penalty",
-}
-for har_key, param_name in PARAM_MAP.items():
-    if har_key in analysis.request_body_template:
-        if kwargs.get(param_name) is not None:
-            payload[har_key] = kwargs[param_name]
+# In __init__, store the supported list:
+self.supported_params = analysis.supported_params
+# e.g. ["temperature", "top_p", "max_tokens", "stop", "presence_penalty"]
+
+# In convert_request, after building the payload:
+for param in self.supported_params:
+    # User's request may have passed this param via kwargs
+    val = kwargs.get(param)
+    if val is not None:
+        payload[param] = val
+```
+
+**How it works at runtime:**
+
+| User sends via OpenAI SDK | `analysis.supported_params` contains | adapter puts in payload |
+|---|---|---|
+| `temperature=0.7` | `"temperature"` | `temperature: 0.7` |
+| `temperature=0.7` | *not in list* | **omitted** — target doesn't support it |
+| `max_tokens=4096, temperature=0.5` | `["temperature"]` | only `temperature: 0.5` passed, `max_tokens` dropped |
+| `stop=["\n\n"], frequency_penalty=0.3` | `["stop"]` | only `stop: ["\n\n"]` passed |
+
+**How `har_parser.py` infers the list:**
+
+```
+1. Collect all HAR POST entries whose URL path matches the chat endpoint.
+2. For each entry, extract JSON body keys.
+3. Match keys against a known alias table:
+     "temperature"        → "temperature"
+     "max_tokens"         → "max_tokens"
+     "max_length"         → "max_tokens"     (alias)
+     "max_new_tokens"     → "max_tokens"     (alias)
+     "top_p"              → "top_p"
+     "top_k"              → "top_k"
+     "presence_penalty"   → "presence_penalty"
+     "frequency_penalty"  → "frequency_penalty"
+     "repetition_penalty" → "repetition_penalty"
+     "stop"               → "stop"
+     "stop_sequences"     → "stop"           (alias)
+     "n"                  → "n"
+     "seed"               → "seed"
+     "user"               → "user"
+4. If a key appears in any request with a non-null, non-zero value,
+   its canonical name is added to supported_params.
+```
+
+This is **zero-cost**: it reads what the browser already sent, without sending any extra probe requests.
+
+**Verification** (optional, added to Step 6):
+
+```python
+# If temperature is supported, send two requests with extreme values
+# and confirm the responses are meaningfully different
+if "temperature" in adapter.supported_params:
+    cold = await _send_with_temp(adapter, 0.0)
+    hot  = await _send_with_temp(adapter, 2.0)
+    if len(cold) == len(hot) and cold == hot:
+        print("[WARN] temperature set but responses identical — target may ignore it")
 ```
 
 ### 1.2 Inject DSML for tool calling (if applicable)
@@ -536,6 +583,7 @@ curl -s -N http://localhost:8000/v1/chat/completions \
 | `has_pow` | `bool` | Challenge endpoint in HAR | — |
 | `pow_endpoint` | `str` | PoW challenge URL path | `/api/v0/chat/create_pow_challenge` |
 | `all_endpoints` | `list[str]` | All unique URL paths in HAR | — |
+| `supported_params` | `list[str]` | OpenAI params seen in HAR request bodies | `["temperature", "top_p"]` |
 | `chat_entry_index` | `int` | Index in HAR entries list | `42` |
 
 ---
@@ -647,6 +695,6 @@ If WASM solver binary is available from the target site, use `wasmtime` instead 
 - Text-only: no multimodal (images/files)
 - Tool calling via DSML injection, not native function calling — depends on model's XML comprehension
 - `seed` / `response_format` / `json_mode` not supported
-- `max_tokens` / `temperature` only if target API exposes them
+- Parameters (`temperature`, `max_tokens`, ...) automatically detected from HAR — only those the target API actually uses will be passed through
 - PoW solver is site-specific (DeepSeek pattern)
 - Cookie-based auth expires; user must refresh HAR when needed
