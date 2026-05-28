@@ -11,20 +11,58 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Union, Any
 
-from adapter import ChatAdapter
+# ── Adapter loading ─────────────────────────────────────────────────
+# Supports both HTTP (ChatAdapter) and WebSocket (WebSocketChatAdapter).
+# The adapter module (adapter.py or ws_adapter.py) must expose an `adapter`
+# instance that implements:
+#   convert_request(messages, stream, tools, tool_choice, **kwargs) → dict
+#   send_request(payload) → dict (OpenAI format)
+#   stream_request(payload) → AsyncGenerator[bytes]
+# AI will replace this import block with the correct adapter at generation time.
+
+HAR_PATH = os.getenv("HAR_PATH", "")
+
+if os.path.exists(HAR_PATH):
+    # Auto-configure from HAR file
+    from har_parser import parse_har
+    analysis = parse_har(HAR_PATH)
+    if analysis.has_websocket:
+        from ws_adapter import WebSocketChatAdapter
+        adapter = WebSocketChatAdapter(
+            ws_url=analysis.ws.ws_url,
+            headers=analysis.headers,
+        )
+        adapter.send_template = analysis.ws.send_template
+        adapter.input_field = analysis.ws.input_field
+        adapter.receive_field = analysis.ws.receive_field
+        adapter.receive_is_streaming = analysis.ws.receive_is_streaming
+        adapter.type_field = analysis.ws.type_field
+        adapter.extra_send_fields = analysis.ws.extra_send_fields
+        adapter.init_messages = analysis.ws.init_messages
+    else:
+        from adapter import ChatAdapter
+        adapter = ChatAdapter(
+            cookies=analysis.cookies,
+            base_url=analysis.base_url,
+        )
+        adapter.chat_endpoint = analysis.chat_endpoint
+else:
+    # Manual configuration via env vars (default mode)
+    from adapter import ChatAdapter
+    adapter = ChatAdapter(
+        cookies=os.getenv("COOKIES", ""),
+        base_url=os.getenv("TARGET_URL", "https://chat.example.com"),
+    )
 
 load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────────────
-TARGET_URL = os.getenv("TARGET_URL", "https://chat.example.com")
-COOKIES = os.getenv("COOKIES", "")
+TARGET_URL = getattr(adapter, 'base_url', os.getenv("TARGET_URL", "https://chat.example.com"))
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 API_KEY = os.getenv("API_KEY", "sk-web2api-placeholder")
 DSML_ENABLED = os.getenv("DSML_ENABLED", "true").lower() in ("true", "1", "yes")
-
-adapter = ChatAdapter(cookies=COOKIES, base_url=TARGET_URL, dsml_enabled=DSML_ENABLED)
 
 # ── FastAPI App ─────────────────────────────────────────────────────
 app = FastAPI(title="web2api", version="0.1.0")

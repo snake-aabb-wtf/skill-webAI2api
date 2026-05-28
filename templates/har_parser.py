@@ -23,8 +23,25 @@ class HarAnalysis:
         self.has_pow: bool = False
         self.pow_endpoint: str = ""
         self.supported_params: list[str] = []
+        self.has_websocket: bool = False
+        self.ws: Optional["WsAnalysis"] = None
         self.all_endpoints: list[str] = []
         self.chat_entry_index: int = -1
+
+
+class WsAnalysis:
+    """Result of analyzing WebSocket messages in a HAR file."""
+
+    def __init__(self):
+        self.ws_url: str = ""
+        self.entry_index: int = -1
+        self.send_template: dict = {}
+        self.input_field: str = "content"
+        self.receive_field: str = "content"
+        self.receive_is_streaming: bool = False
+        self.type_field: str = ""
+        self.extra_send_fields: dict = {}
+        self.init_messages: list[dict] = []
 
 
 CHAT_ENDPOINT_KEYWORDS = [
@@ -304,6 +321,212 @@ def _find_challenge_entries(entries: list) -> list:
     return challenges
 
 
+# ── WebSocket detection ─────────────────────────────────────────────
+
+WS_CHAT_KEYWORDS = [
+    "message", "content", "prompt", "text", "query", "ask",
+    "input", "conversation", "chat", "send", "talk",
+]
+
+def _find_websocket_entry(entries: list) -> Optional[dict]:
+    """Find a HAR entry that upgraded to WebSocket (HTTP 101)
+    and carries chat-like messages in _webSocketMessages.
+
+    Returns a dict with keys: index, ws_url, messages, init_messages
+    or None if no suitable WS entry found.
+    """
+    for i, entry in enumerate(entries):
+        resp = entry.get("response", {})
+        if resp.get("status") != 101:
+            continue
+
+        ws_messages = entry.get("_webSocketMessages", [])
+        if not isinstance(ws_messages, list) or len(ws_messages) < 2:
+            continue
+
+        sends = [m for m in ws_messages if m.get("type") == "send"]
+        receives = [m for m in ws_messages if m.get("type") == "receive"]
+        if not sends or not receives:
+            continue
+
+        # Check opcode — we only support text frames (opcode 1)
+        for m in ws_messages:
+            if m.get("opcode") not in (None, 1):
+                continue
+
+        # Score: does this look like a chat conversation?
+        chat_score = 0
+        for m in sends:
+            raw = m.get("data", "")
+            try:
+                d = json.loads(raw)
+                if isinstance(d, dict):
+                    keys = " ".join(d.keys()).lower()
+                    if any(kw in keys for kw in WS_CHAT_KEYWORDS):
+                        chat_score += 2
+                    if "stream" in d:
+                        chat_score += 1
+                    # Long string value → user message
+                    for v in d.values():
+                        if isinstance(v, str) and len(v) > 10:
+                            chat_score += 2
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        for m in receives:
+            raw = m.get("data", "")
+            try:
+                d = json.loads(raw)
+                if isinstance(d, dict):
+                    for f in WS_CHAT_KEYWORDS:
+                        val = d.get(f)
+                        if isinstance(val, str) and len(val) > 10:
+                            chat_score += 2
+                            break
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if chat_score < 3:
+            continue
+
+        # Passed all checks — this is a chat WebSocket
+        req = entry.get("request", {})
+        req_url = req.get("url", "")
+
+        # Build template from first send message
+        first_send = sends[0]
+        try:
+            send_template = json.loads(first_send.get("data", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            send_template = {}
+
+        # Find init messages (sends before the first meaningful chat message)
+        init_msgs = []
+        for m in ws_messages:
+            if m.get("type") != "send":
+                continue
+            raw = m.get("data", "")
+            try:
+                d = json.loads(raw)
+                if isinstance(d, dict):
+                    # If body has no chat-like key, it's probably an init/connect message
+                    keys = " ".join(d.keys()).lower()
+                    if not any(kw in keys for kw in WS_CHAT_KEYWORDS):
+                        init_msgs.append(d)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        req_parsed = urlparse(req_url)
+        ws_scheme = "wss" if req_parsed.scheme == "https" else "ws"
+        ws_url = f"{ws_scheme}://{req_parsed.netloc}{req_parsed.path}"
+        if req_parsed.query:
+            ws_url += "?" + req_parsed.query
+
+        return {
+            "index": i,
+            "ws_url": ws_url,
+            "messages": ws_messages,
+            "send_template": send_template,
+            "sends": sends,
+            "receives": receives,
+            "init_messages": init_msgs,
+        }
+
+    return None
+
+
+def _analyze_websocket(ws_info: dict) -> WsAnalysis:
+    """Analyze WebSocket messages to extract send/receive patterns."""
+    ws = WsAnalysis()
+    ws.ws_url = ws_info["ws_url"]
+    ws.entry_index = ws_info["index"]
+    ws.send_template = ws_info.get("send_template", {})
+    ws.init_messages = ws_info.get("init_messages", [])
+
+    # Find input field in send template
+    send_template = ws.send_template
+    if "messages" in send_template:
+        ws.input_field = "messages"
+    elif "prompt" in send_template:
+        ws.input_field = "prompt"
+    elif "content" in send_template:
+        ws.input_field = "content"
+    elif "query" in send_template:
+        ws.input_field = "query"
+    elif "message" in send_template:
+        ws.input_field = "message"
+    elif "text" in send_template:
+        ws.input_field = "text"
+    elif "input" in send_template:
+        ws.input_field = "input"
+    else:
+        # Find the longest string field
+        max_len = 0
+        for k, v in send_template.items():
+            if isinstance(v, str) and len(v) > max_len:
+                max_len = len(v)
+                ws.input_field = k
+        if not ws.input_field:
+            ws.input_field = "content"
+
+    # Find content field in receive messages
+    receives = ws_info.get("receives", [])
+    receive_texts = []
+    for m in receives:
+        raw = m.get("data", "")
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict):
+                receive_texts.append(d)
+        except (json.JSONDecodeError, TypeError):
+            receive_texts.append({"__raw_text__": raw})
+
+    # Detect streaming: multiple receives for one send
+    ws.receive_is_streaming = len(receives) >= 3
+
+    # Find content field in first receive
+    if receive_texts:
+        first = receive_texts[0]
+        for key in ["content", "answer", "reply", "text", "response",
+                     "output", "completion", "message", "data"]:
+            if key in first:
+                val = first[key]
+                if isinstance(val, str) and len(val) > 0:
+                    ws.receive_field = key
+                    break
+                if isinstance(val, dict):
+                    sub = val.get("content", "") or val.get("text", "")
+                    if sub:
+                        ws.receive_field = f"{key}.content"
+                        break
+        else:
+            # Deep search
+            path = _find_content_field(first)
+            if path:
+                ws.receive_field = path
+
+    # Detect type/event field that distinguishes message types
+    seen_types = set()
+    for d in receive_texts:
+        if isinstance(d, dict):
+            for tkey in ("type", "event", "action", "method"):
+                val = d.get(tkey)
+                if isinstance(val, str):
+                    seen_types.add(val)
+                    ws.type_field = tkey
+    if len(seen_types) <= 1:
+        ws.type_field = ""
+
+    # Detect extra fields that should be carried over in every send
+    if send_template:
+        ws.extra_send_fields = {
+            k: v for k, v in send_template.items()
+            if k != ws.input_field and k != "stream"
+        }
+
+    return ws
+
+
 # Parameters known from OpenAI spec that a target API might support.
 # Key = the name used in the target API's request body.
 # Value = the OpenAI canonical name (used in SKILL.md and user-facing docs).
@@ -468,6 +691,12 @@ def parse_har(har_path: str) -> HarAnalysis:
                         parts.append(f"{name}={value}")
                 if parts:
                     analysis.cookies = "; ".join(parts)
+
+    # ── WebSocket detection ──────────────────────────────────────
+    ws_info = _find_websocket_entry(entries)
+    if ws_info is not None:
+        analysis.has_websocket = True
+        analysis.ws = _analyze_websocket(ws_info)
 
     seen = set()
     for entry in entries:

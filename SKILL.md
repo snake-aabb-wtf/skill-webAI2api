@@ -7,7 +7,7 @@ description: "Reverse-engineer any web AI chat interface into an OpenAI-compatib
 
 ## Overview
 
-User uploads a `.har` file. You parse it, extract every detail of the chat API, then modify `templates/adapter.py` into a working OpenAI-compatible proxy.
+User uploads a `.har` file. You parse it, extract every detail of the chat API, then generate an OpenAI-compatible proxy. Supports both **HTTP (SSE/JSON)** and **WebSocket** transports — auto-detected from the HAR file.
 
 ---
 
@@ -48,7 +48,32 @@ It scores every HAR entry by these rules (higher = more likely):
 | Response body is JSON with a long string field (>50 chars) | +5 |
 | URL path contains `.js`, `.css`, `.png`, `analytics`, `favicon` | -50 each |
 
-The entry with the highest score >= 0 is the chat API. If max score < 0, fallback to manual selection (list all POST entries for user to pick).
+The entry with the highest score >= 0 is the chat API.
+
+### 0.3 WebSocket detection (fallback from HTTP)
+
+If no HTTP POST entry scored >= 0, or if a `response.status == 101` (Switching Protocols) entry is found, `parse_har` tries WebSocket detection:
+
+1. Find entries with `status == 101` that have a `_webSocketMessages` array
+2. Require at least 1 "send" + 1 "receive" message in the array
+3. Score the messages: JSON body contains `message`/`content`/`prompt` keywords, long string values, `stream` flag
+4. If score >= 3, mark `analysis.has_websocket = True` and populate `analysis.ws.*`
+
+**WS scoring criteria:**
+
+| Criterion | Points |
+|-----------|--------|
+| Entry has `_webSocketMessages` with ≥1 send + ≥1 receive | required |
+| Send frame JSON has chat-like keys (message, content, prompt, text, query) | +2 each key |
+| Send frame JSON has `stream` field | +1 |
+| Send frame JSON has a string value longer than 10 characters | +2 |
+| Receive frame JSON has a chat-like key with a long string value | +2 per frame |
+| **Minimum score to qualify** | **3** |
+
+The WS entry also provides:
+- **Send template**: JSON structure of the first send message (used as payload blueprint)
+- **Init messages**: any send messages that lack chat content keys (likely auth/init frames to replay on connect)
+- **Streaming detection**: if ≥3 receive frames for a single send → `receive_is_streaming = True`
 
 ### 0.2 What `analysis` contains
 
@@ -71,6 +96,15 @@ analysis.all_endpoints         # list of all unique URL paths in HAR
 analysis.chat_entry_index      # index of the matched entry
 analysis.supported_params      # ["temperature", "top_p", "max_tokens", ...]
                                # inferred from HAR bodies (zero-cost probe)
+analysis.has_websocket         # True / False — WebSocket detected
+analysis.ws.ws_url             # "wss://chat.example.com/ws" (WS URL)
+analysis.ws.send_template      # JSON dict of the first send frame
+analysis.ws.input_field        # which key in send_template holds user msg
+analysis.ws.receive_field      # which key in receive frames holds AI text
+analysis.ws.receive_is_streaming  # True if multiple receives per send
+analysis.ws.type_field         # if frames use a type/event discriminator
+analysis.ws.extra_send_fields  # non-input keys to carry in every send
+analysis.ws.init_messages      # auth/init frames to replay after connect
 ```
 
 ---
@@ -155,6 +189,46 @@ if history_field:
 payload["stream"] = stream
 ```
 
+### Rule 6: WebSocket — `analysis.has_websocket == True`
+
+The target API uses WebSocket, not HTTP. **Do NOT modify `adapter.py`**. Instead, generate **`ws_adapter.py`** from `templates/ws_adapter.py`.
+
+**Send frame format** — derived from `analysis.ws.send_template`:
+
+```python
+# HAR show first send frame was: {"type": "chat", "content": "Hello", "stream": true}
+# analysis.ws.input_field = "content"
+# analysis.ws.extra_send_fields = {"type": "chat"}
+payload = dict(analysis.ws.extra_send_fields)  # {"type": "chat"}
+last = messages[-1]["content"] if messages else ""
+if isinstance(last, list):
+    last = " ".join(p.get("text","") for p in last if p.get("type")=="text")
+payload[analysis.ws.input_field] = last       # {"type": "chat", "content": "Hello"}
+if stream:
+    payload["stream"] = True
+```
+
+If `input_field` is `"messages"`, pass the full messages array instead:
+
+```python
+# HAR: {"messages": [...], "model": "gpt-4o"}
+payload = dict(analysis.ws.extra_send_fields)
+payload["messages"] = messages
+if stream:
+    payload["stream"] = True
+```
+
+**Receive extraction** — based on `analysis.ws.receive_field`. Same dot-path logic as Step 2.2.
+
+**Init messages** — if `analysis.ws.init_messages` is non-empty, send them in order right after WebSocket connect before the first user message:
+
+```python
+await ws.send(json.dumps(init_msg))
+# ... for each init_msg in analysis.ws.init_messages
+```
+
+**Type field filtering** — if `analysis.ws.type_field` is set, skip receive frames whose type is `error`, `ping`, `pong`, `ack`, `status`, `typing`, etc.
+
 ### 1.1 Dynamic parameter passthrough (auto-inferred from HAR)
 
 `analysis.supported_params` contains every OpenAI-compatible parameter that the target API was observed using in the HAR. Use this list to dynamically decide which kwargs to pass through:
@@ -230,9 +304,37 @@ if tools and self.dsml_enabled and self.dsml_ready:
 
 Place this **before** the payload construction so `messages` is already modified.
 
----
+### 1.3 Building `ws_adapter.py` (only when `has_websocket`)
 
-## Step 2 — Determine the Response Field
+If `analysis.has_websocket` is True, generate **`ws_adapter.py`** from `templates/ws_adapter.py`. Do NOT modify `adapter.py`.
+
+**Modification table — map each `analysis.ws.*` field to the corresponding `WebSocketChatAdapter` attribute:**
+
+| `ws_adapter.py` attribute/method | Set from `analysis.ws.*` |
+|---|---|
+| `self.ws_url` | `analysis.ws.ws_url` |
+| `self.send_template` | `analysis.ws.send_template` |
+| `self.input_field` | `analysis.ws.input_field` |
+| `self.receive_field` | `analysis.ws.receive_field` |
+| `self.receive_is_streaming` | `analysis.ws.receive_is_streaming` |
+| `self.type_field` | `analysis.ws.type_field` |
+| `self.extra_send_fields` | `analysis.ws.extra_send_fields` |
+| `self.init_messages` | `analysis.ws.init_messages` |
+| `_connect()` | Override only if target requires custom subprotocols |
+| `_extract_content_from_frame()` | Uses `receive_field` + `type_field` — no change needed |
+| `_is_done_frame()` | Override only if done signal differs from defaults |
+
+**The template already uses `self.input_field` and `self.extra_send_fields` in `convert_request()`** — just fill them in `__init__` and it works.
+
+**Key behavioral differences from HTTP adapter to note:**
+
+1. **Connection lifecycle**: Each request opens a fresh WS connection (connect → send → receive → close). If the HAR shows multiple send/receive pairs on one WS (persistent session), change to reuse the connection.
+2. **Init messages**: If `init_messages` is non-empty, `_connect()` automatically sends them after connecting. No additional code needed.
+3. **Frame done detection**: `_is_done_frame()` checks multiple patterns (finish_reason, done flag, type field, `[DONE]`). If the target uses a unique signal, override this method.
+4. **Non-streaming mode**: When `receive_is_streaming` is False, the adapter reads exactly one receive frame and returns it. When True, it reads frames until `_is_done_frame()` returns True.
+5. **Binary frames**: WebSocketChatAdapter only handles text frames (opcode 1). Binary frames (opcode 2) are not supported — report this limitation.
+
+---
 
 ### 2.1 Non-streaming response
 
@@ -432,10 +534,10 @@ def __init__(self, cookies: str, base_url: str, dsml_enabled: bool = True):
 
 Some APIs require state across requests (session ID, chat session ID).
 
-**Check `analysis.request_body_template`** for keys like:
+**Check `analysis.request_body_template` or `analysis.ws.send_template`** for keys like:
 - `chat_session_id`, `session_id`, `conversation_id`, `conversationId`
 
-If found, add state management to the adapter:
+### For HTTP adapter
 
 ```python
 def __init__(self, ...):
@@ -452,6 +554,26 @@ def convert_request(self, ...):
     # After receiving response, extract new session ID:
     # response.get("chat_session_id") → update self.chat_session_id
 ```
+
+### For WebSocket adapter (persistent connection)
+
+If the HAR shows multiple send/receive pairs on the **same** WebSocket (check if `_webSocketMessages` has alternating send/receive across the whole entry), the target expects a persistent connection. Modify `WebSocketChatAdapter` to keep the WS open:
+
+```python
+def __init__(self, ...):
+    ...
+    self._ws = None  # persistent connection
+    self._session_id = analysis.ws.extra_send_fields.get("chat_session_id")
+    self._auto_update = "chat_session_id" in analysis.ws.extra_send_fields
+
+async def _get_connection(self):
+    """Reuse or create a persistent WebSocket."""
+    if self._ws is None or self._ws.closed:
+        self._ws = await self._connect()
+    return self._ws
+```
+
+Then replace `_connect()` calls in `send_request`/`stream_request` with `_get_connection()`. This avoids reconnecting and re-sending init messages for every request.
 
 ---
 
@@ -505,7 +627,63 @@ async def verify_streaming():
     return True
 ```
 
-### 6.3 Failure recovery
+### 6.3 WebSocket verification (only when `has_websocket`)
+
+```python
+import websockets
+async def verify_ws_non_streaming():
+    payload = adapter.convert_request(
+        [{"role": "user", "content": "Hello"}],
+        stream=False,
+    )
+    ws = await adapter._connect()
+    try:
+        await ws.send(json.dumps(payload, ensure_ascii=False))
+        frames = []
+        if adapter.receive_is_streaming:
+            async for raw in ws:
+                text = adapter._extract_content_from_frame(raw)
+                if text:
+                    frames.append(text)
+                if adapter._is_done_frame(raw):
+                    break
+        else:
+            raw = await ws.recv()
+            text = adapter._extract_content_from_frame(raw)
+            if text:
+                frames.append(text)
+        assert len(frames) > 0, "WS non-streaming: no content frames"
+        print(f"[OK] WS non-streaming: got {len(frames)} frames")
+        return True
+    finally:
+        await ws.close()
+
+async def verify_ws_streaming():
+    if not adapter.receive_is_streaming:
+        print("[SKIP] WS streaming: target is non-streaming")
+        return True
+    payload = adapter.convert_request(
+        [{"role": "user", "content": "Hello"}],
+        stream=True,
+    )
+    ws = await adapter._connect()
+    try:
+        await ws.send(json.dumps(payload, ensure_ascii=False))
+        chunks = []
+        async for raw in ws:
+            text = adapter._extract_content_from_frame(raw)
+            if text:
+                chunks.append(text)
+            if adapter._is_done_frame(raw):
+                break
+        assert len(chunks) > 1, f"WS streaming: only {len(chunks)} chunks (need >1)"
+        print(f"[OK] WS streaming: got {len(chunks)} chunks")
+        return True
+    finally:
+        await ws.close()
+```
+
+### 6.4 Failure recovery
 
 | Failure | Root cause | Fix |
 |---------|-----------|-----|
@@ -515,6 +693,11 @@ async def verify_streaming():
 | Empty content in JSON | Wrong content field path | Re-scan JSON keys; pick the longest string value path |
 | No SSE chunks | Wrong streaming mode or field | Read raw HAR SSE text; manually identify which key holds text |
 | Connection refused | Target blocked by CORS/geo | Add `Origin` and `Referer` headers from HAR |
+| WS connection refused | Wrong URL scheme/port | Check `analysis.ws.ws_url`; try both `wss://` and `ws://` |
+| WS closed immediately | Auth/init messages missing | Check `analysis.ws.init_messages` and verify they replay correctly |
+| WS receive empty | Wrong `receive_field` | Re-scan HAR receive frame JSON keys; pick the longest string value |
+| WS stream stuck | Wrong done signal | Read HAR receive frames manually; find what signals completion |
+| WS binary frame | Target sends opcode 2 | Cannot support — tell user this AI uses binary WS frames |
 
 **Max 3 retry rounds.** After each round, adjust and re-run verification. If still failing after 3, output what was tried and ask user for a fresh HAR file.
 
@@ -523,7 +706,7 @@ async def verify_streaming():
 ## Step 7 — Start Proxy & Final Test
 
 ```bash
-pip install fastapi uvicorn httpx python-dotenv
+pip install fastapi uvicorn httpx python-dotenv websockets
 python server.py &
 sleep 2
 
@@ -546,8 +729,9 @@ curl -s -N http://localhost:8000/v1/chat/completions \
 
 
 
-1. `adapter.py` — modified adapter
-2. `server.py` — from template (no changes needed)
+1. `adapter.py` — modified HTTP adapter (if HTTP detected)
+2. `ws_adapter.py` — WebSocket adapter (if `has_websocket` is True)
+3. `server.py` — from template (no changes needed)
 3. `.env.example`:
    ```
    TARGET_URL=https://chat.example.com
@@ -558,7 +742,7 @@ curl -s -N http://localhost:8000/v1/chat/completions \
    API_KEY=sk-web2api-placeholder
    DSML_ENABLED=true
    ```
-4. `requirements.txt`: `fastapi`, `uvicorn`, `httpx`, `python-dotenv`, `pydantic`
+4. `requirements.txt`: `fastapi`, `uvicorn`, `httpx`, `python-dotenv`, `pydantic`, `websockets`
 5. Start command and E2E verification output
 6. Integration guide: `OPENAI_API_BASE=http://localhost:8000/v1`
 
@@ -585,6 +769,15 @@ curl -s -N http://localhost:8000/v1/chat/completions \
 | `all_endpoints` | `list[str]` | All unique URL paths in HAR | — |
 | `supported_params` | `list[str]` | OpenAI params seen in HAR request bodies | `["temperature", "top_p"]` |
 | `chat_entry_index` | `int` | Index in HAR entries list | `42` |
+| `has_websocket` | `bool` | WebSocket entry detected in HAR | `True` or `False` |
+| `ws.ws_url` | `str` | WebSocket URL (wss:// or ws://) | `wss://chat.example.com/ws` |
+| `ws.send_template` | `dict` | JSON of first WS send frame | `{type: "chat", content: ""}` |
+| `ws.input_field` | `str` | Key in send_template for user msg | `"content"` / `"messages"` |
+| `ws.receive_field` | `str` | Key in receive frames for AI text | `"content"` / `"answer"` |
+| `ws.receive_is_streaming` | `bool` | Multiple receives per single send | `True` / `False` |
+| `ws.type_field` | `str` | Frame type discriminator key | `"type"` / `"event"` / `""` |
+| `ws.extra_send_fields` | `dict` | Non-input keys to carry in every send | `{type: "chat", id: 1}` |
+| `ws.init_messages` | `list[dict]` | Auth/init frames to replay on connect | `[{type: "auth", ...}]` |
 
 ---
 
@@ -642,6 +835,7 @@ The `data:` line content is not JSON at all — it's a plain string.
 | Open WebUI | `/chat/completions` | `{messages, model}` | OpenAI standard | `nested` |
 | Gradio Chat | `/api/chat` | `{data: [...]}` | `data[0]` | `raw_text` or `plain_token` |
 | Custom NextJS | `/api/chat` | `{prompt, history}` | `text` / `answer` | varies |
+| **WebSocket Generic** | `wss://.../ws` | send: `{content: "..."}` / `{messages: [...]}` | receive `content` | `receive_is_streaming` auto-detected |
 
 ---
 
@@ -698,3 +892,6 @@ If WASM solver binary is available from the target site, use `wasmtime` instead 
 - Parameters (`temperature`, `max_tokens`, ...) automatically detected from HAR — only those the target API actually uses will be passed through
 - PoW solver is site-specific (DeepSeek pattern)
 - Cookie-based auth expires; user must refresh HAR when needed
+- WebSocket only supports text frames (opcode 1) — binary frames not supported
+- WebSocket adapter requires `websockets` library (added to requirements)
+- WS init messages are replayed on every new connection — ensure they are idempotent
