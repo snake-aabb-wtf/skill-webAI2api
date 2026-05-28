@@ -1,86 +1,77 @@
-# WAF (Web Application Firewall) 绕过指南
+# WAF 绕过指南
 
-## 适用场景
+## 本质
 
-目标网站使用了 Web 应用防火墙（Cloudflare、Akamai、Imperva 等），自动请求被拦截。
+WAF（Web Application Firewall）通过分析请求特征识别并拦截非浏览器流量。判断依据包括：请求头缺失、HTTP 指纹不一致、请求频率异常、Cookie 不完整等。绕过 WAF 的关键是**让请求看起来和浏览器发出的完全一致**。
 
-## 检测方法
+## 检测线索
 
-| 特征 | 可能原因 |
+### 从响应状态码和头识别
+
+| 特征 | 含义 |
 |---|---|
-| 响应状态码 403 / 503 | WAF 拦截 |
-| 响应体包含 `Just a moment...` | Cloudflare 质询页面 |
-| 响应体包含 `cf-error`、`cf-browser-verification` | Cloudflare 人机验证 |
-| 响应头包含 `server: cloudflare` + 状态码 403 | Cloudflare WAF 规则命中 |
-| 请求被重定向到 `/_challenge` 等路径 | 自定义 WAF |
+| 状态码 403 + 响应体空或极短 | WAF 直接拒绝 |
+| 状态码 503 + `server: cloudflare` | Cloudflare 速率限制 |
+| 响应头包含 `cf-ray` | 请求经过了 Cloudflare |
+| 响应 HTML 含 `window._cf_chl_opt` | Cloudflare JS 质询 |
+| 状态码 406 | WAF 内容过滤 |
+| 响应含 `blocked`、`denied`、`forbidden` | 通用拦截页面 |
 
-## 方案 A：完整复制浏览器环境（最有效）
+### 从行为模式识别
 
-从 HAR 中提取**所有**请求头，不要只取 Cookie：
+- **部分端点可用、部分不可用**：WAF 只保护了聊天 API 路径
+- **GET 正常、POST 被拦**：WAF 规则针对 POST 请求体做了检查
+- **短时间多发被拦、慢速正常**：速率触发的 WAF 规则
+- **更换 IP 后问题消失**：基于 IP 信誉的 WAF
 
-```python
-# 从 HAR 中复制完整 headers
-headers = {}
-for h in chat_request["headers"]:
-    name = h.get("name", "")
-    if name.lower() not in ("content-length",):
-        headers[name] = h.get("value", "")
-```
+## 策略优先级
 
-关键头列表：
-- `User-Agent` — 必须完整（包括 Chrome 版本号）
-- `Accept` — `text/html,application/json,...`
-- `Accept-Language` — `zh-CN,zh;q=0.9`
-- `Accept-Encoding` — `gzip, deflate, br`
-- `Sec-Ch-Ua` — 浏览器标识（HAR 中自动包含）
-- `Sec-Ch-Ua-Mobile`、`Sec-Ch-Ua-Platform`
-- `Origin` — 必须匹配目标域名
-- `Referer` — 必须匹配聊天页面 URL
+按成功率从高到低排列：
 
-## 方案 B：添加延迟和请求节流
+### 1. 完整复制浏览器请求头（最有效）
 
-WAF 通常检测请求频率。在适配器中加入随机延迟：
+WAF 最基础的检测是 HTTP 头完备性。从 HAR 的聊天请求中复制**全部**请求头，不做任何删减。特别关键的字段：
 
-```python
-import asyncio
-import random
+| 请求头 | 作用 |
+|---|---|
+| `User-Agent` | 包含 Chrome/Safari 版本号、WebKit 版本、OS 标识的完整字符串 |
+| `Sec-Ch-Ua` / `Sec-Ch-Ua-Platform` / `Sec-Ch-Ua-Mobile` | 客户端提示（Client Hints），WAF 会校验一致性 |
+| `Accept` / `Accept-Language` / `Accept-Encoding` | 必须与浏览器一致，不能省略 |
+| `Origin` | 必须等于目标域名 |
+| `Referer` | 必须指向聊天页面 URL |
+| `Sec-Fetch-Site` / `Sec-Fetch-Mode` / `Sec-Fetch-Dest` | Fetch 元数据头，缺失会触发 WAF |
 
-async def send_request(self, payload):
-    # 随机延迟 0.5-2 秒，模拟人类操作
-    await asyncio.sleep(random.uniform(0.5, 2.0))
-    # ... 发送请求
-```
+这些头在 HAR 的 `request.headers` 中全有，直接复制即可。
 
-## 方案 C：使用实际浏览器 Cookie
+### 2. 从 Set-Cookie 中补全 Cookie
 
-WAF 依赖 Cookie 中的会话标识判断是否为真人。从 HAR 中提取**所有** Cookie 值，包括：
+WAF（尤其是 Cloudflare）依赖 Cookie 判断请求来源。如果直接使用用户提供的 Cookie 字符串可能不够，因为某些令牌是在登录过程中通过多个 Set-Cookie 累积的。
 
-- `__cf_bm`（Cloudflare 机器人管理）
-- `cf_clearance`（Cloudflare 验证通过标识）
-- `_cfuvid`（Cloudflare 用户视频 ID）
-- `session_id`、`csrf_token` 等站点特有值
+遍历 HAR 中所有响应（不仅是聊天请求）的 Set-Cookie 头，收集以下值：
+- `cf_clearance` — Cloudflare 验证通行证
+- `__cf_bm` — 机器人管理令牌
+- `_cfuvid` — 用户视频指纹
+- 站点自己的会话令牌
 
-```python
-# 合并 HAR 中所有 Set-Cookie 到请求 Cookie 中
-all_cookies = []
-for entry in entries:
-    resp = entry.get("response", {})
-    for h in resp.get("headers", []):
-        if h.get("name", "").lower() == "set-cookie":
-            all_cookies.append(h.get("value", ""))
-```
+将这些值 merge 到最终的 Cookie 字符串中。
 
-## 方案 D：IP / 代理轮换
+### 3. 请求节流
 
-如果 WAF 根据 IP 限流：
+如果前两步后仍然被间歇性拦截，大概率是速率触发。在每次请求间加入 1-3 秒随机延迟。注意不要用固定间隔——固定间隔反而更容易被识别为脚本。
 
-1. 使用住宅代理轮换
-2. 每次请求使用不同的出口 IP
-3. 或告知用户：该网站对 API 反代不友好，建议换其他目标
+### 4. 使用与 HAR 相同的 HTTP 版本
 
-## 降级策略
+HAR 中注明了每次请求的 HTTP 版本（`httpVersion` 字段）。如果浏览器用的是 HTTP/2 而你用 HTTP/1.1 发请求，WAF 可能检测到指纹差异。使用支持 HTTP/2 的客户端（`httpx` 默认支持 h2）。
 
-如果以上方案全部无效，向用户输出：
-- 哪些请求头被 WAF 拦截了
-- 建议的方案（重新用浏览器导出一份干净的 HAR）
-- 该站点可能不适合做 API 反代
+## 边界情况
+
+- **请求体格式被 WAF 检查**：JSON 中的某些字段名可能触发规则（如 `"role":"system"` 被误认为注入）。尝试简化请求体或调整字段名
+- **WebSocket 连接被 WAF 拦截**：部分 WAF 不拦截 WebSocket 升级（101），但会检测 WS 帧内容。保留完整的 Origin 和 Cookie
+- **WAF 同时检查 TLS 指纹**：JA3 指纹检测。需要使用真实浏览器的 TLS 库（无解，极少数企业 WAF 才会用）
+- **Cloudflare 同时在多个层拦截**：Bot Management + WAF + Rate Limit 三层叠加。每一层都需要通过
+
+## 彻底失败
+
+- 完整复制请求头、补全 Cookie、加入延迟后仍然 403 → 可能涉及 TLS 指纹或 IP 信誉，此站点不适合反代
+- 换用住宅代理后仍然被拦 → WAF 策略不依赖 IP，主动告知用户
+- 目标使用了自定义 WAF + JS 质询 → 需要运行完整浏览器引擎，超出本工具范围

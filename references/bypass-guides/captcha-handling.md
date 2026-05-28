@@ -1,62 +1,92 @@
-# Captcha 挑战绕过指南
+# Captcha 处理指南
 
-## 适用场景
+## 本质
 
-目标网站弹出验证码（CAPTCHA）拦截自动请求，常见于 Cloudflare Turnstile、Google reCAPTCHA、hCaptcha。
+Captcha（验证码）是人机识别系统，用于区分真实用户和自动化脚本。常见类型包括 Cloudflare Turnstile、Google reCAPTCHA、hCaptcha。**Captcha 无法通过纯代码自动求解**，必须借助用户交互或浏览器环境。
 
-## 检测方法
+## 检测线索
 
-HAR 文件中出现以下特征：
+### 从响应状态码识别
+
+- 状态码 **403** + 响应 HTML 包含验证脚本 → 被 Captcha 拦截
+- 状态码 **503** + 响应含 `Just a moment...` → Cloudflare 质询中
+
+### 从响应内容关键词识别
+
+搜索响应文本中的关键字：
+
+| 关键词 | 可能来源 |
+|---|---|
+| `turnstile` | Cloudflare Turnstile |
+| `cf-turnstile` | Cloudflare Turnstile |
+| `recaptcha` / `g-recaptcha` | Google reCAPTCHA |
+| `hcaptcha` | hCaptcha |
+| `cf-browser-verification` | Cloudflare JS 质询 |
+| `_cf_chl_opt` | Cloudflare 挑战参数 |
+| `challenge-platform` | Cloudflare 挑战平台 |
+
+### 从请求重定向路径识别
+
+如果请求被 `302` 或 `307` 重定向到以下路径，基本可确认遇上了验证：
 
 ```
-响应包含 "captcha"、"turnstile"、"recaptcha"、"hcaptcha" 字段
-请求被重定向到 /challenge、/captcha、/under-attack 等路径
-响应状态码 403 且包含验证页面 HTML
+/cdn-cgi/bot/captcha
+/cdn-cgi/challenge-platform
+/_challenge
+/captcha
+/verify
 ```
 
-## 方案 A：引导用户手动获取 Cookie（推荐）
+### 从 Cookie 缺失识别
 
-Captcha 无法自动求解。最佳方案是让用户在浏览器中完成验证后导出 HAR：
+请求缺少 `cf_clearance` 或 `__cf_bm` Cookie 时，Cloudflare 会触发验证。
+
+## 策略选择
+
+| 检测结果 | 推荐策略 |
+|---|---|
+| Cloudflare Turnstile | 引导用户导出 HAR（清浏览器后登录一次） |
+| reCAPTCHA / hCaptcha | 无法绕过，建议换目标 |
+| 仅有 `cf_clearance` 缺失 | 从 HAR 中找 Set-Cookie 提取 |
+| 首次访问即触发验证 | 用户需在浏览器中手动过验证后再导出 HAR |
+
+## 核心策略：引导用户生成有效 HAR
+
+Captcha 无法自动解，但**用户已经在浏览器里过了一次验证**。你只是需要从 HAR 中拿到验证后的 Cookie。
+
+引导话术模板：
 
 ```
-1. 在浏览器中打开目标网站
-2. 完成验证码（手动点击）
-3. 正常登录并发送一条聊天消息
-4. F12 → Network → Save all as HAR with content
-5. 重新上传 HAR 文件
+该网站有验证码保护。请按以下步骤操作：
+1. 打开隐身窗口，登录目标网站
+2. 手动完成验证码（如果需要）
+3. 发送一条聊天消息
+4. F12 → Network → 右键 → Save all as HAR with content
+5. 上传新的 HAR 文件
 ```
 
-HAR 中已经包含了验证后的 Cookie，直接使用即可。
+## 从 HAR 中提取验证凭证
 
-## 方案 B：Cloudflare Turnstile 特殊处理
+即使聊天请求本身被拦截，HAR 中之前成功的 Set-Cookie 响应可能已经包含了验证通过的令牌：
 
-如果检测到 Cloudflare Turnstile，尝试以下步骤：
+| Cookie 名 | 来源 | 有效期 |
+|---|---|---|
+| `cf_clearance` | Cloudflare 验证通过 | 通常 30 分钟到 24 小时 |
+| `__cf_bm` | Cloudflare 机器人管理 | 通常 30 分钟 |
+| `_cfuvid` | Cloudflare 用户视频 ID | 会话级 |
+| `session` | 站点自身登录会话 | 取决于站点 |
 
-1. 请求目标页面时带上 `User-Agent` 和 `Accept-Language` 等完整浏览器头
-2. 先用 `GET` 请求首页，收集页面中的 `turnstile` token
-3. 部分网站允许在 Cookie 中直接携带 `cf_clearance` 绕过
+遍历 HAR 中所有响应的 Set-Cookie 头，合并到请求 Cookie 中。
 
-```python
-# 从 HAR 的响应 Cookie 中提取 cf_clearance
-def extract_cf_clearance(entries):
-    for entry in entries:
-        resp = entry.get("response", {})
-        for cookie in resp.get("cookies", []):
-            if cookie.get("name") == "cf_clearance":
-                return cookie.get("value")
-    return None
-```
+## 边界情况
 
-## 方案 C：降低请求频率
+- **验证码类型无法识别**：响应不包含任何已知关键词 → 按通用验证码处理，要求用户重新导出 HAR
+- **站点头部多次验证**：每次 POST 前都弹验证码 → 此站点不适合反代
+- **Cookie 极短过期**：`cf_clearance` 仅几分钟 → 需告知用户频繁换 Cookie
+- **部分请求通过、部分拦截**：可能是速率触发 → 加入请求间延迟
 
-部分 WAF 将高频请求误判为机器人。如果请求被拦截：
+## 彻底失败
 
-1. 在每次请求之间加入 1-3 秒延迟
-2. 确保请求头与浏览器完全一致（从 HAR 中复制完整 headers）
-3. 在请求头中添加 `Accept-Language: zh-CN,zh;q=0.9`
-
-## 无法绕过的情况
-
-- hCaptcha / reCAPTCHA v3 等需要视觉识别的验证码
-- 目标网站使用了人机验证且没有提供 API 免验证通道
-- 这种情况下只能告知用户：该网站不支持自动化 API 反代
+- 用户提供了 HAR 但仍然 403 → Cookie 已过期，让用户重新导出一份
+- 目标使用了企业级 Bot Management（非 Turnstile）→ 无解，此站点不可反代
+- 目标使用了自研验证码 → 逻辑未知，不可绕过

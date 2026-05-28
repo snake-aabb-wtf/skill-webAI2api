@@ -1,107 +1,64 @@
 # PoW (Proof-of-Work) 挑战绕过指南
 
-## 适用场景
+## 本质
 
-目标聊天 API 在发送消息前需要先求解一个哈希碰撞挑战。常见于 DeepSeek 等国产 AI 网站。
+目标在接收聊天请求前强制客户端做一次哈希碰撞，证明请求来自真实浏览器而非脚本。碰撞难度由 `difficulty` 控制（例如 4 表示 SHA256 结果前缀必须有 4 个零字节），`expire_at` 设定了挑战的有效期窗口。
 
-## 检测方法
+## 检测线索
 
-HAR 文件中出现以下请求路径之一：
+### 从 HAR 路径识别
 
-```
-/api/v0/chat/create_pow_challenge
-/api/challenge
-/api/v1/challenge
-pow
-```
+搜索所有 entry 的 URL 路径，包含以下关键字之一即可能为 PoW 挑战端点：
 
-响应 JSON 包含字段：`algorithm`、`challenge`、`salt`、`expire_at`、`difficulty`、`signature`。
+- `create_pow_challenge` — DeepSeek 标准路径
+- `challenge` — 通用路径
+- `pow` — 通用缩写
+- `captcha` / `turnstile` — 注意区分 PoW 与图形验证码
 
-## 求解方案
+### 从响应结构识别
 
-### 方案 A：纯 Python 哈希求解（推荐，无额外依赖）
+PoW 挑战的响应 JSON 通常包含以下字段组合：
 
-```python
-import hashlib, json, base64, httpx
+| 字段 | 含义 | 示例 |
+|---|---|---|
+| `algorithm` | 哈希算法名 | `DeepSeekHashV1`, `SHA256` |
+| `challenge` | 挑战标识符 | 长随机字符串 |
+| `salt` | 盐值 | 时间戳或随机串 |
+| `expire_at` | 过期时间戳（秒） | `1716800000` |
+| `difficulty` | 哈希前缀零字节数 | `4` |
+| `signature` | 签名（用于构造应答） | 长字符串 |
 
-def solve_pow(base_url, headers):
-    # 1. 获取挑战
-    resp = httpx.post(
-        f"{base_url}/api/v0/chat/create_pow_challenge",
-        json={"target_path": "/api/v0/chat/completion"},
-        headers=headers, timeout=15,
-    )
-    biz = resp.json().get("data", {}).get("biz_data", {}).get("challenge", {})
-    salt = biz["salt"]
-    expire_at = biz["expire_at"]
-    difficulty = biz["difficulty"]
-    signature = biz["signature"]
-    challenge = biz["challenge"]
-    target_path = biz.get("target_path", "/api/v0/chat/completion")
+### 从请求顺序推断
 
-    # 2. 暴力碰撞
-    nonce = 0
-    while True:
-        raw = f"{salt}{expire_at}{nonce}{target_path}"
-        h = hashlib.sha256(raw.encode()).hexdigest()
-        if h.startswith("0" * difficulty):
-            break
-        nonce += 1
+如果 HAR 中聊天 API 请求之前总是跟随着一个对未知端点的 POST 请求，且后者返回 JSON 中包含数值型 `difficulty` 字段，基本可以确认是 PoW。
 
-    # 3. 编码应答
-    answer = json.dumps({
-        "algorithm": "DeepSeekHashV1",
-        "challenge": challenge,
-        "salt": salt,
-        "answer": nonce,
-        "signature": signature,
-        "target_path": target_path,
-    }, separators=(",", ":"))
-    return {"X-DS-PoW-Response": base64.b64encode(answer.encode()).decode()}
-```
+## 策略选择
 
-### 方案 B：WASM 求解（性能高，但需要从目标站点提取 wasm）
+| 条件 | 推荐方案 |
+|---|---|
+| HAR 中可提取到 `.wasm` 文件 | 使用 WASM 求解，性能最优 |
+| HAR 中无 wasm，但 PoW 结构清晰 | 纯 Python SHA256 碰撞 |
+| difficulty > 5 | 告知用户难度过高，可能无法实时求解 |
+| 响应结构不标准 | 先用通用解析提取字段，再逐个尝试哈希算法 |
 
-```python
-from wasmtime import Store, Module, Instance
+## 集成位置
 
-class WASMSolver:
-    def __init__(self, wasm_bytes):
-        self.store = Store()
-        module = Module(self.store.engine, wasm_bytes)
-        self.instance = Instance(self.store, module, [])
-        self.exports = self.instance.exports(self.store)
-        self.solve_fn = self.exports.get("wasm_solve") or self.exports.get("solve")
-        self.malloc = self.exports["__wbindgen_export_0"]
-        self.memory = self.exports["memory"]
+PoW 是**每次请求前的前置步骤**，应放在 `_ensure_auth_headers()` 中。每次聊天请求都会调用它：
 
-    def solve(self, challenge, salt, expire_at, difficulty):
-        # 调用 wasm 导出的 solve 函数
-        return self.solve_fn(self.store, challenge, salt, expire_at, difficulty)
-```
+1. 检查 `expire_at` 是否已过期 → 是则重新获取挑战
+2. 求解碰撞 → 编码应答 → 返回请求头
+3. 将返回的 header（如 `X-DS-PoW-Response`）合并到聊天请求中
 
-### 获取 wasm 的方法
+## 边界情况
 
-1. 在 HAR 的 JS chunk 请求中找到 `.wasm` 文件
-2. 或者从浏览器 DevTools → Sources → Page 中搜索 `.wasm`
-3. 右键 → Save as 保存到本地
+- **挑战复用**：部分站点允许同一挑战在 expire 前多次使用，可缓存减少开销
+- **难度波动**：同一站点在不同负载下的 difficulty 可能不同，求解时间不固定
+- **算法变种**：除了 SHA256，还可能遇到 SHA512、BLAKE2、或自定义哈希
+- **嵌套响应**：部分站点的挑战数据嵌套在 `data.biz_data.challenge` 下，需递归提取
+- **签名验证**：应答中的 signature 必须与挑战时返回的一致，否则服务端拒绝
 
-## 集成到 adapter
+## 彻底失败
 
-```python
-class ChatAdapter:
-    def __init__(self, ...):
-        self.auth_type = "pow"
-        self._solver = None  # 延迟初始化
-
-    def _ensure_auth_headers(self):
-        if self.auth_type == "pow":
-            return solve_pow(self.base_url, self.headers)
-        return {}
-```
-
-## 注意
-
-- 挑战有 `expire_at` 过期时间，必须在过期前求解并发送聊天请求
-- 每次聊天请求都需要重新求解（不能复用）
-- 如果用户 Cookie 已过期，PoW 请求也会返回 401
+- 无法定位 challenge 端点 → 告知用户此站点可能使用自定义反自动化方案
+- 求解时间超过 30 秒 → 提示用户 difficulty 过高，建议换目标
+- 应答发送后仍返回 401 → 挑战已过期，需要重新获取
