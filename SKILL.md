@@ -436,6 +436,12 @@ if not content:
 
 ## Step 3 — Configure Auth
 
+Before configuring auth, check `references/bypass-guides/` for detailed techniques on handling CAPTCHA, WAF, and PoW challenges. The guides contain ready-to-use code snippets and detection methods.
+
+- [PoW 挑战求解](references/bypass-guides/pow-solve.md)
+- [验证码处理](references/bypass-guides/captcha-handling.md)
+- [WAF 绕过](references/bypass-guides/waf-bypass.md)
+
 ### 3.1 None (most common)
 
 ```python
