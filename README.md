@@ -11,15 +11,16 @@
     │
     ▼
 Step 0: HAR 文件自动解析（har_parser.py）
-    │   ├─ 自动识别聊天 API 端点（评分算法）
+    │   ├─ 自动识别聊天 API 端点（HTTP 评分 / WebSocket 回退检测）
     │   ├─ 提取请求头 / Cookie / Authorization
     │   ├─ 提取请求体格式模板
-    │   ├─ 分析响应结构（JSON 字段 / SSE 格式）
+    │   ├─ 分析响应结构（JSON 字段 / SSE 格式 / WebSocket 帧）
     │   ├─ 自动推断支持的参数（temperature, max_tokens等）
-    │   └─ 检测 PoW 挑战端点
+    │   ├─ 检测 PoW 挑战端点
+    │   └─ 提取 WebSocket send/receive 帧模式（如适用）
     │
     ▼
-Step 1: 利用 HAR 结果构建适配器（无需手动探测）
+Step 1: 自动选择适配器类型（HTTP ↔ WebSocket）
     │
     ▼
 Step 1.5: 自动处理鉴权挑战（PoW / Token 刷新 / Captcha）
@@ -31,10 +32,10 @@ Step 1.6: 自动探测 DSML 兼容性（工具调用支持）
 Step 2: 自动验证并微调（发真实请求确认）
     │
     ▼
-Step 3: 自动生成适配器 adapter.py + server.py
+Step 3: 自动生成适配器 adapter.py 或 ws_adapter.py
     │
     ▼
-Step 4: 自动验证（非流式 + 流式，失败则重试 3 轮）
+Step 4: 自动验证（HTTP 非流式+流式 / WebSocket 非流式+流式）
     │
     ▼
 Step 5: 启动代理 + 端到端测试
@@ -70,6 +71,8 @@ Step 6: 输出集成指南
 | 参数自动推断 | ✅ 从 HAR 零成本检测目标支持的参数，只透传实际有效的 |
 | `max_tokens` / `temperature` | ✅ 自动推断，仅目标支持时才透传 |
 | SSE 原始文本 | ✅ 支持非 JSON 纯文本 SSE（raw_text 模式） |
+| WebSocket 传输 | ✅ 自动检测 WS 连接，提取帧模式，生成 WebSocketChatAdapter |
+| 传输协议自动识别 | ✅ 无需指定 HTTP 还是 WebSocket，从 HAR 自动判断 |
 
 ## 支持的网页类型
 
@@ -91,8 +94,9 @@ web2api/
 ├── SKILL.md                      # 技能定义（AI 执行的工作流指令）
 ├── templates/
 │   ├── har_parser.py             # HAR 文件解析器
-│   ├── adapter.py                # 适配器模板（含 DSML 工具调用支持）
-│   ├── server.py                 # FastAPI 代理服务器模板
+│   ├── adapter.py                # HTTP 适配器模板（含 DSML 工具调用支持）
+│   ├── ws_adapter.py             # WebSocket 适配器模板
+│   ├── server.py                 # FastAPI 代理服务器模板（支持 HTTP + WS 双模式）
 │   ├── tool_dsml.py              # DSML prompt 构建 + XML 解析
 │   └── tool_sieve.py             # StreamSieve 流式分离引擎
 ├── LICENSE
@@ -103,13 +107,13 @@ web2api/
 
 运行完成后，AI 将生成：
 
-1. **adapter.py** — 完整填充的适配器（已验证通过）
+1. **adapter.py** 或 **ws_adapter.py** — 完整填充的适配器（已验证通过）
 2. **server.py** — OpenAI 兼容代理服务器
 3. **har_parser.py** — HAR 解析工具（保留以便后续更新）
-4. **requirements.txt** — 依赖清单
+4. **requirements.txt** — 依赖清单（含 `websockets`）
 5. **.env.example** — 配置模板
 6. **启动命令** — 一行启动代理
-7. **验证结果** — 流式 + 非流式测试确认
+7. **验证结果** — 流式 + 非流式测试确认（HTTP 或 WebSocket 对应）
 8. **集成指南** — 如何接入 Claude Code / Cursor / 任意 OpenAI SDK
 
 ## 如何获取 .har 文件
@@ -127,3 +131,5 @@ web2api/
 - 不支持多模态输入 — 仅文本对话
 - `seed` / `response_format` / `json_mode` 等 OpenAI 扩展特性不可用
 - 参数（`temperature`, `max_tokens` 等）自动从 HAR 推断，只有目标 API 实际使用过的才会透传
+- WebSocket 仅支持 text frame（opcode=1），不支持 binary frame
+- WebSocket 适配器依赖 `websockets` 库
