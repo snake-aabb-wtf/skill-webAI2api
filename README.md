@@ -15,6 +15,7 @@ Step 0: HAR 文件自动解析（har_parser.py）
     │   ├─ 提取请求头 / Cookie / Authorization
     │   ├─ 提取请求体格式模板
     │   ├─ 分析响应结构（JSON 字段 / SSE 格式）
+    │   ├─ 自动推断支持的参数（temperature, max_tokens等）
     │   └─ 检测 PoW 挑战端点
     │
     ▼
@@ -66,7 +67,9 @@ Step 6: 输出集成指南
 | Proof-of-Work 自动求解 | ✅（WASM） |
 | 工具调用 (function calling) | ⚠️ 基于 DSML 提示词注入，非原生 |
 | 多模态（图片/文件） | ❌ |
-| `max_tokens` / `temperature` | ⚠️ 取决于目标 |
+| 参数自动推断 | ✅ 从 HAR 零成本检测目标支持的参数，只透传实际有效的 |
+| `max_tokens` / `temperature` | ✅ 自动推断，仅目标支持时才透传 |
+| SSE 原始文本 | ✅ 支持非 JSON 纯文本 SSE（raw_text 模式） |
 
 ## 支持的网页类型
 
@@ -123,4 +126,4 @@ web2api/
 - 工具调用基于 DSML 提示词注入，不是原生 function calling，取决于目标模型能否理解 XML 指令
 - 不支持多模态输入 — 仅文本对话
 - `seed` / `response_format` / `json_mode` 等 OpenAI 扩展特性不可用
-- `max_tokens` / `temperature` 取决于目标 API 是否支持
+- 参数（`temperature`, `max_tokens` 等）自动从 HAR 推断，只有目标 API 实际使用过的才会透传
